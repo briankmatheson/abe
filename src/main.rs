@@ -1,11 +1,15 @@
 use nix::mount::{MsFlags, mount};
 use nix::unistd::symlinkat;
 use std::fs::{self, File};
-use std::io::{Result, Write};
+use std::io::{Result, Write, Error, ErrorKind};
 use std::path::Path;
+use std::process::Command;
+use std::env::var;
+use uuid::Uuid;
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
+
 
 struct Subsystem {
     name: String,
@@ -78,11 +82,28 @@ fn ensure_configfs_mounted() -> Result<()> {
     Ok(())
 }
 
+pub fn create_lv(name: &str, size: &str) -> Result<String> {
+    let output = Command::new("lvcreate")
+        .args(["-L", size, "-n", name, "extradisk"])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!(
+                "lvcreate failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+
+    Ok(format!("/dev/abe/{}", name))
+}
 fn main() -> Result<()> {
     ensure_configfs_mounted()?;
 
-    let subsystem = Subsystem::create("mynvme")?;
-    subsystem.add_namespace(1, "/dev/nvme1n1")?;
+    let subsystem = Subsystem::create("abe")?;
+    subsystem.add_namespace(1, &create_lv(&Uuid::new_v4().to_string(), "10G")?)?;
 
     let port = Port::create(1, "192.168.1.100", "4420", "tcp")?;
     port.link_subsystem(&subsystem)?;
