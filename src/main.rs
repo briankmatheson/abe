@@ -7,8 +7,10 @@ use std::process::Command;
 use std::env::var;
 use uuid::Uuid;
 
+
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
+const PREFIX: &str = "172.23.23.0/24";
 
 
 struct Subsystem {
@@ -38,21 +40,24 @@ impl Subsystem {
 }
 
 struct Port {
-    id: u32,
+    id: str,
+    iteration: u32 = 0,
 }
 
 impl Port {
-    fn create(id: u32, traddr: &str, trsvcid: &str, trtype: &str) -> Result<Self> {
+    fn create(id: &str, trsvcid: &str, trtype: &str) -> Result<Self> {
         let path = format!("{}/ports/{}", NVMET_PATH, id);
         fs::create_dir_all(&path)?;
 
         let addr_path = format!("{}/addr", path);
         fs::create_dir_all(&addr_path)?;
+        iteration = iteration + 1;
+        let traddr = cidr.parse(PREFIX).hosts()[index]?;
         File::create(format!("{}/traddr", addr_path))?.write_all(traddr.as_bytes())?;
         File::create(format!("{}/trsvcid", addr_path))?.write_all(trsvcid.as_bytes())?;
         File::create(format!("{}/trtype", addr_path))?.write_all(trtype.as_bytes())?;
 
-        Ok(Self { id })
+        Ok(Self{traddr})
     }
 
     fn link_subsystem(&self, subsystem: &Subsystem) -> Result<()> {
@@ -69,6 +74,7 @@ impl Port {
 
 fn ensure_configfs_mounted() -> Result<()> {
     if !Path::new(NVMET_PATH).exists() {
+
         println!("Mounting configfs...");
         mount::<str, str, str, str>(
             Some("none"),
@@ -81,6 +87,22 @@ fn ensure_configfs_mounted() -> Result<()> {
     }
     Ok(())
 }
+
+fn ensure_dummy0_present() -> Result<()> {
+
+    Ok(())
+}
+
+fn ensure_nvmet_present() -> Result<()> {
+    if !Path::new(NVMET_PATH).exists() {
+        println!("Installing nvmet...");
+        Command::new("modprobe")
+            .args(["nvmet"])
+            .output()
+            .expect("modprobe failed");
+    }
+    Ok(())
+}   
 
 pub fn create_lv(name: &str, size: &str) -> Result<String> {
     let output = Command::new("lvcreate")
@@ -99,13 +121,16 @@ pub fn create_lv(name: &str, size: &str) -> Result<String> {
 
     Ok(format!("/dev/abe/{}", name))
 }
+
 fn main() -> Result<()> {
     ensure_configfs_mounted()?;
+    ensure_nvmet_present()?;
 
-    let subsystem = Subsystem::create("abe")?;
-    subsystem.add_namespace(1, &create_lv(&Uuid::new_v4().to_string(), "10G")?)?;
+    let uuid = Uuid::new_v4().to_string();
+    let subsystem = Subsystem::create(&uuid, "4420", "tcp")?;
+    subsystem.add_namespace(uuid, &create_lv(&uuid, "1G")?)?;
 
-    let port = Port::create(1, "192.168.1.100", "4420", "tcp")?;
+    let port = Port::create(uuid, "4420", "tcp")?;
     port.link_subsystem(&subsystem)?;
 
     println!("NVMe target configured with Rust!");
