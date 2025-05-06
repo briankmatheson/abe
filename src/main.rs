@@ -5,8 +5,9 @@ use std::io::{Result, Write, Error, ErrorKind};
 use std::path::Path;
 use std::process::Command;
 use std::env::var;
+use std::net::Ipv4Addr;
 use uuid::Uuid;
-
+use ipnet::Ipv4Net;
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
@@ -27,7 +28,7 @@ impl Subsystem {
         })
     }
 
-    fn add_namespace(&self, nsid: u32, device_path: &str) -> Result<()> {
+    fn add_namespace(&self, nsid: &str, device_path: &str) -> Result<()> {
         let ns_path = format!(
             "{}/subsystems/{}/namespaces/{}",
             NVMET_PATH, self.name, nsid
@@ -40,24 +41,25 @@ impl Subsystem {
 }
 
 struct Port {
-    id: str,
-    iteration: u32 = 0,
+    id: String,
+    traddr: String
 }
 
 impl Port {
-    fn create(id: &str, trsvcid: &str, trtype: &str) -> Result<Self> {
+    fn create(id: String, trsvcid: &str, trtype: &str, iteration: u32) -> Result<Port> {
         let path = format!("{}/ports/{}", NVMET_PATH, id);
         fs::create_dir_all(&path)?;
 
         let addr_path = format!("{}/addr", path);
         fs::create_dir_all(&addr_path)?;
-        iteration = iteration + 1;
-        let traddr = cidr.parse(PREFIX).hosts()[index]?;
+        let traddr: String = (PREFIX.parse::<ipnet::Ipv4Net>().unwrap().network()).to_string() + ":" + trsvcid;
+
+        
+        
         File::create(format!("{}/traddr", addr_path))?.write_all(traddr.as_bytes())?;
         File::create(format!("{}/trsvcid", addr_path))?.write_all(trsvcid.as_bytes())?;
         File::create(format!("{}/trtype", addr_path))?.write_all(trtype.as_bytes())?;
-
-        Ok(Self{traddr})
+        Ok(Port{id: id, traddr: traddr })
     }
 
     fn link_subsystem(&self, subsystem: &Subsystem) -> Result<()> {
@@ -70,6 +72,7 @@ impl Port {
 
         Ok(())
     }
+
 }
 
 fn ensure_configfs_mounted() -> Result<()> {
@@ -126,13 +129,14 @@ fn main() -> Result<()> {
     ensure_configfs_mounted()?;
     ensure_nvmet_present()?;
 
+    let i = 1;
     let uuid = Uuid::new_v4().to_string();
-    let subsystem = Subsystem::create(&uuid, "4420", "tcp")?;
-    subsystem.add_namespace(uuid, &create_lv(&uuid, "1G")?)?;
+    let subsystem = Subsystem::create(&uuid)?;
+    subsystem.add_namespace(&uuid, &create_lv(&uuid, "1G")?)?;
 
-    let port = Port::create(uuid, "4420", "tcp")?;
+    let port = Port::create(uuid, "4420", "tcp", i)?;
     port.link_subsystem(&subsystem)?;
 
-    println!("NVMe target configured with Rust!");
+    println!("{} {}", port.id, port.traddr);
     Ok(())
 }
