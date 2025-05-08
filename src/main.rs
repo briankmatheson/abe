@@ -8,11 +8,13 @@ use std::env::var;
 use std::net::Ipv4Addr;
 use uuid::Uuid;
 use ipnet::Ipv4Net;
+use env_logger::Env;
 use log::{info, warn};
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
 const PREFIX: &str = "172.23.23.0/24";
+
 
 
 struct Subsystem {
@@ -22,10 +24,10 @@ impl Subsystem {
     fn create(name: &str) -> Result<Self> {
         let path = format!("{}/subsystems/{}", NVMET_PATH, name);
 
-        warn!("making nvmet subsystem dif");
+        info!("making nvmet subsystem dif");
         fs::create_dir_all(&path)?;
 
-        warn!("allowing any host");
+        info!("allowing any host");
         File::create(format!("{}/attr_allow_any_host", path))?.write_all(b"1")?;
         Ok(Self {
             name: name.to_string(),
@@ -37,13 +39,14 @@ impl Subsystem {
             "{}/subsystems/{}/namespaces/{}",
             NVMET_PATH, self.name, nsid
         );
-        warn!("making namespace {ns_path}")   ;     
+        info!("making namespace {ns_path}");     
         fs::create_dir_all(&ns_path)?;
 
-        warn!("adding device {device_path}");
+        info!("adding device {device_path}");
         File::create(format!("{}/device_path", ns_path))?.write_all(device_path.as_bytes())?;
 
-        warn!("enabling {ns_path}");
+        
+        info!("enabling {ns_path}/enable");
         File::create(format!("{}/enable", ns_path))?.write_all(b"1")?;
         Ok(())
     }
@@ -52,36 +55,42 @@ impl Subsystem {
 
 struct Port {
     id: String,
-    traddr: String
+    traddr: String,
+    iteration: u32
 }
 impl Port {
-    fn create(id: String, trsvcid: &str, trtype: &str, iteration: u32) -> Result<Port> {
-        let path = format!("{}/ports/{}", NVMET_PATH, id);
+    fn create(id: String, trsvcid: &str, trtype: &str, iteration: u32) -> Result<Port> {    
+        let path = format!("{}/ports/{}", NVMET_PATH, iteration);
 
-        warn!("making port {path}");
+        info!("making port {path}");
         fs::create_dir_all(&path)?;
 
-        let addr_path = format!("{}/addr", path);
         
-        warn!("making addr{addr_path}");
-        fs::create_dir_all(&addr_path)?;
-        let traddr: String = (PREFIX.parse::<ipnet::Ipv4Net>().unwrap().network()).to_string() + ":" + trsvcid;
+        info!("making addr {path}");
+        let traddr: String = "192.168.1.24".to_string();
+        
+        info!("writing addr_traddr {path}");
+        File::create(format!("{}/addr_traddr", path))?.write_all(traddr.as_bytes())?;
 
-        
-        
-        File::create(format!("{}/traddr", addr_path))?.write_all(traddr.as_bytes())?;
-        File::create(format!("{}/trsvcid", addr_path))?.write_all(trsvcid.as_bytes())?;
-        File::create(format!("{}/trtype", addr_path))?.write_all(trtype.as_bytes())?;
-        Ok(Port{id: id, traddr: traddr })
+        info!("writing addr_trsvcid{path}");
+        File::create(format!("{}/addr_trsvcid", path))?.write_all(trsvcid.as_bytes())?;
+
+
+        info!("making addr_trtype {path}");
+        File::create(format!("{}/addr_trtype", path))?.write_all(trtype.as_bytes())?;
+
+        info!("making addr_adrfam {path}");
+        File::create(format!("{}/addr_trtype", path))?.write_all("ipv4".as_bytes())?;
+        Ok(Port{id: id, traddr: traddr, iteration: iteration})
     }
 
     fn link_subsystem(&self, subsystem: &Subsystem) -> Result<()> {
         let subsys_path: String = format!("{}/subsystems/{}", NVMET_PATH, subsystem.name);
         let port_subsys_link: String = format!(
             "{}/ports/{}/subsystems/{}",
-            NVMET_PATH, self.id, subsystem.name
+            NVMET_PATH, self.iteration, subsystem.name
         );
-        warn!("linking port to subsystem");
+        info!("linking port to subsystem");
         symlinkat(subsys_path.as_str(), None, port_subsys_link.as_str())?;
 
         Ok(())
@@ -90,8 +99,10 @@ impl Port {
 }
 
 fn ensure_configfs_mounted() -> Result<()> {
-    warn!("Mounting configfs...");
-    if !Path::new(NVMET_PATH).exists() {
+    //fixme this doens't work
+    
+    info!("Mounting configfs...");
+    if !Path::new(CONFIGFS_PATH).exists() {
         mount::<str, str, str, str>(
             Some("none"),
             CONFIGFS_PATH,
@@ -110,7 +121,7 @@ fn ensure_dummy0_present() -> Result<()> {
 }
 
 fn ensure_nvmet_present() -> Result<()> {
-    warn!("making nvmet subsystem");        
+    info!("making nvmet subsystem");        
     if !Path::new(NVMET_PATH).exists() {
         Command::new("modprobe")
             .args(["nvmet"])
@@ -121,9 +132,9 @@ fn ensure_nvmet_present() -> Result<()> {
 }   
 
 pub fn create_lv(name: &str, size: &str) -> Result<String> {
-    warn!("making lv {name}");
+    info!("making lv {name}");
     let output = Command::new("lvcreate")
-        .args(["-L", size, "-n", name, "extradisk"])
+        .args(["-L", size, "-n", name, "abe"])
         .output()?;
 
     if !output.status.success() {
@@ -140,16 +151,21 @@ pub fn create_lv(name: &str, size: &str) -> Result<String> {
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
+    
     ensure_configfs_mounted()?;
     ensure_nvmet_present()?;
-
+    
     let i = 1;
     let uuid = Uuid::new_v4().to_string();
-    let subsystem = Subsystem::create(&uuid)?;
-    subsystem.add_namespace(&uuid, &create_lv(&uuid, "1G")?)?;
+
+    let lv_path = create_lv(&uuid, "1G")?;
+    
+    let target = Subsystem::create(&uuid)?;
+    target.add_namespace("1", &lv_path)?;
 
     let port = Port::create(uuid, "4420", "tcp", i)?;
-    port.link_subsystem(&subsystem)?;
+    port.link_subsystem(&target)?;
 
     println!("{} {}", port.id, port.traddr);
     Ok(())
