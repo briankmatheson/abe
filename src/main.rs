@@ -10,13 +10,26 @@ use uuid::Uuid;
 use ipnet::Ipv4Net;
 use env_logger::Env;
 use log::{info, warn};
+use axum::{
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+
+
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
 const PREFIX: &str = "172.23.23.0/24";
 
 
+#[derive(Serialize, Deserialize)]
+struct Message {
+    message: String,
+}
 
+// NVME over TCP target subsystem
 struct Subsystem {
     name: String,
 }
@@ -33,7 +46,6 @@ impl Subsystem {
             name: name.to_string(),
         })
     }
-
     fn add_namespace(&self, nsid: &str, device_path: &str) -> Result<()> {
         let ns_path = format!(
             "{}/subsystems/{}/namespaces/{}",
@@ -52,10 +64,11 @@ impl Subsystem {
     }
 }
 
-
+// NVME over TCP port
 struct Port {
     id: String,
     traddr: String,
+    trsvcid: String,
     iteration: u32
 }
 impl Port {
@@ -64,9 +77,6 @@ impl Port {
 
         info!("making port {path}");
         fs::create_dir_all(&path)?;
-
-        
-        info!("making addr {path}");
         let traddr: String = "192.168.1.24".to_string();
         
         info!("writing addr_traddr {path}");
@@ -75,13 +85,16 @@ impl Port {
         info!("writing addr_trsvcid{path}");
         File::create(format!("{}/addr_trsvcid", path))?.write_all(trsvcid.as_bytes())?;
 
-
         info!("making addr_trtype {path}");
         File::create(format!("{}/addr_trtype", path))?.write_all(trtype.as_bytes())?;
 
         info!("making addr_adrfam {path}");
-        File::create(format!("{}/addr_trtype", path))?.write_all("ipv4".as_bytes())?;
-        Ok(Port{id: id, traddr: traddr, iteration: iteration})
+        File::create(format!("{}/addr_adrfam", path))?.write_all("ipv4".as_bytes())?;
+        Ok(Port{
+            id: id, 
+            traddr: traddr, 
+            trsvcid: trsvcid.to_string(), 
+            iteration: iteration})
     }
 
     fn link_subsystem(&self, subsystem: &Subsystem) -> Result<()> {
@@ -92,6 +105,7 @@ impl Port {
         );
         info!("linking port to subsystem");
         symlinkat(subsys_path.as_str(), None, port_subsys_link.as_str())?;
+
 
         Ok(())
     }
@@ -150,23 +164,38 @@ pub fn create_lv(name: &str, size: &str) -> Result<String> {
     Ok(format!("/dev/abe/{}", name))
 }
 
-fn main() -> Result<()> {
-    env_logger::init();
-    
-    ensure_configfs_mounted()?;
-    ensure_nvmet_present()?;
-    
-    let i = 1;
+fn configure() -> Result<()> {
+    let mut paths = fs::read_dir(format!("{NVMET_PATH}/ports")).unwrap();
+    let latest = paths.nth(0).unwrap().unwrap().path();
+    let last_port = latest.to_string_lossy().split("/").last().unwrap().to_string();
+    info!("last_port is {}", last_port);
+
+    let i = last_port.parse::<u32>().unwrap() + 1;
+    info!("i is {}", i);
+    let target = Path::new(NVMET_PATH).join("ports").join(format!("{i}"));
     let uuid = Uuid::new_v4().to_string();
 
     let lv_path = create_lv(&uuid, "1G")?;
     
     let target = Subsystem::create(&uuid)?;
     target.add_namespace("1", &lv_path)?;
+    let svc_port = format!("44{:03}", i);
+    info!("svc_port is {svc_port}");
 
-    let port = Port::create(uuid, "4420", "tcp", i)?;
+
+    let port = Port::create(uuid, &svc_port, "tcp", i)?;
     port.link_subsystem(&target)?;
 
-    println!("{} {}", port.id, port.traddr);
+    println!("{} {}:{}", port.id, port.traddr, port.trsvcid);
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+    
+    ensure_configfs_mounted()?;
+    ensure_nvmet_present()?;
+    
+    configure();
     Ok(())
 }
