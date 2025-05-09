@@ -1,40 +1,55 @@
 use nix::mount::{MsFlags, mount};
 use nix::unistd::symlinkat;
+use std::path::PathBuf;
 use std::fs::{self, File};
 use std::io::{Result, Write, Error, ErrorKind};
 use std::path::Path;
 use std::process::Command;
 use std::env::var;
 use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 use uuid::Uuid;
 use ipnet::Ipv4Net;
 use env_logger::Env;
 use log::{info, warn};
 use axum::{
     routing::{get, post},
-    Json, Router,
+    Json, Router
 };
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-
+//use env_inventory;
 
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
 const PREFIX: &str = "172.23.23.0/24";
 
+//env_inventory::register!(RUST_LOG = "info")
 
 #[derive(Serialize, Deserialize)]
 struct Message {
     message: String,
 }
 
+async fn hello() -> Json<Message> {
+    Json(Message {
+        message: "Hello, world!".to_string(),
+    })
+}
+
+async fn echo(Json(payload): Json<Message>) -> Json<Message> {
+    Json(Message {
+        message: format!("Echo: {}", payload.message),
+    })
+}
+
+
 // NVME over TCP target subsystem
 struct Subsystem {
     name: String,
 }
 impl Subsystem {
-    fn create(name: &str) -> Result<Self> {
+    async fn create(name: &str) -> Result<Self> {
         let path = format!("{}/subsystems/{}", NVMET_PATH, name);
 
         info!("making nvmet subsystem dif");
@@ -106,7 +121,6 @@ impl Port {
         info!("linking port to subsystem");
         symlinkat(subsys_path.as_str(), None, port_subsys_link.as_str())?;
 
-
         Ok(())
     }
 
@@ -145,7 +159,7 @@ fn ensure_nvmet_present() -> Result<()> {
     Ok(())
 }   
 
-pub fn create_lv(name: &str, size: &str) -> Result<String> {
+pub fn create_lv(name: &str, size: &str) -> Result<()> {
     info!("making lv {name}");
     let output = Command::new("lvcreate")
         .args(["-L", size, "-n", name, "abe"])
@@ -160,42 +174,65 @@ pub fn create_lv(name: &str, size: &str) -> Result<String> {
             ),
         ));
     }
+    Ok(())
+}    
 
-    Ok(format!("/dev/abe/{}", name))
-}
-
-fn configure() -> Result<()> {
+async fn configure() -> Json<Message> {
     let mut paths = fs::read_dir(format!("{NVMET_PATH}/ports")).unwrap();
-    let latest = paths.nth(0).unwrap().unwrap().path();
-    let last_port = latest.to_string_lossy().split("/").last().unwrap().to_string();
+    let mut latest: PathBuf;
+    if paths.count() > 0 {
+        latest = paths.nth(0).unwrap().unwrap().path();
+    } else {
+        latest = "0";
+    }
+        
+    let last_port = latest
     info!("last_port is {}", last_port);
 
     let i = last_port.parse::<u32>().unwrap() + 1;
     info!("i is {}", i);
-    let target = Path::new(NVMET_PATH).join("ports").join(format!("{i}"));
-    let uuid = Uuid::new_v4().to_string();
-
-    let lv_path = create_lv(&uuid, "1G")?;
     
-    let target = Subsystem::create(&uuid)?;
-    target.add_namespace("1", &lv_path)?;
+    let uuid = Uuid::new_v4().to_string();
+    create_lv(&uuid, "1G").unwrap();
+
+    let lv_path = format!("/dev/abe/{uuid}");
+    
+    let target = Subsystem::create(&uuid).await.unwrap();
+    target.add_namespace("1", &lv_path).unwrap();
+    
     let svc_port = format!("44{:03}", i);
     info!("svc_port is {svc_port}");
 
 
-    let port = Port::create(uuid, &svc_port, "tcp", i)?;
-    port.link_subsystem(&target)?;
+    let port = Port::create(uuid.clone(), &svc_port, "tcp", i).unwrap();
+    port.link_subsystem(&target);
 
     println!("{} {}:{}", port.id, port.traddr, port.trsvcid);
-    Ok(())
+
+    Json(Message {
+        message: format!("sudo nvme discover -a {} -t tcp -s {}; sudo nvme connect -a {} -t tcp -s {} -n {}",
+			 port.traddr,
+			 port.trsvcid,
+			 port.traddr,
+			 port.trsvcid,
+			 uuid),
+    })
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() {
     env_logger::init();
     
-    ensure_configfs_mounted()?;
-    ensure_nvmet_present()?;
-    
-    configure();
-    Ok(())
+    ensure_configfs_mounted();
+    ensure_nvmet_present();
+
+    let app = Router::new()
+        .route("/", get(hello))
+        .route("/echo", post(echo))
+        .route("/create-vol", get(configure));
+
+    let addr = SocketAddr::from(([192, 168, 1, 24], 80));
+    println!("Listening on http://{}", addr);
+    let listener = tokio::net::TcpListener::bind("192.168.1.24:80").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
