@@ -162,7 +162,7 @@ fn ensure_nvmet_present() -> Result<()> {
 pub fn create_lv(name: &str, size: &str) -> Result<()> {
     info!("making lv {name}");
     let output = Command::new("lvcreate")
-        .args(["-L", size, "-n", name, "abe"])
+        .args(["-y", "-W", "y", "-L", size, "-n", name, "abe"])
         .output()?;
 
     if !output.status.success() {
@@ -178,15 +178,17 @@ pub fn create_lv(name: &str, size: &str) -> Result<()> {
 }    
 
 async fn configure() -> Json<Message> {
-    let mut paths = fs::read_dir(format!("{NVMET_PATH}/ports")).unwrap();
-    let mut latest: PathBuf;
-    if paths.count() > 0 {
-        latest = paths.nth(0).unwrap().unwrap().path();
-    } else {
-        latest = "0";
+    let mut numpaths = fs::read_dir(format!("{NVMET_PATH}/ports")).unwrap().count();
+    info!("numpaths is {}", numpaths);
+
+    let mut last_port: &str = "0";
+    let latest_entry: PathBuf;
+    if numpaths > 0 {
+        let first: fs::DirEntry =
+            fs::read_dir(format!("{NVMET_PATH}/ports")).unwrap().nth(0).unwrap().unwrap();
+        latest_entry = first.path();
+        last_port = latest_entry.file_name().unwrap().to_str().unwrap();
     }
-        
-    let last_port = latest
     info!("last_port is {}", last_port);
 
     let i = last_port.parse::<u32>().unwrap() + 1;
@@ -229,7 +231,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(hello))
         .route("/echo", post(echo))
-        .route("/create-vol", get(configure));
+        .route("/configure", get(configure));
 
     let addr = SocketAddr::from(([192, 168, 1, 24], 80));
     println!("Listening on http://{}", addr);
