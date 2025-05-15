@@ -148,6 +148,11 @@ fn ensure_dummy0_present() -> Result<()> {
     Ok(())
 }
 
+fn lv_path_for_uuid(uuid: &str) ->  String {
+    let s: String = format!("/dev/abe/{uuid}");
+    s
+}
+
 fn ensure_nvmet_present() -> Result<()> {
     info!("making nvmet subsystem");        
     if !Path::new(NVMET_PATH).exists() {
@@ -174,11 +179,24 @@ pub fn create_lv(name: &str, size: &str) -> Result<()> {
             ),
         ));
     }
+    let output = Command::new("parted")
+        .args([&format!("/dev/abe/{name}"), "mklabel", "gpt"])
+        .output()?;
+    let output = Command::new("parted")
+        .args([&format!("/dev/abe/{name}"), "mkpart", "primary", "0%", "100%"])
+        .output()?;
+    let output = Command::new("parted")
+        .args([&format!("/dev/abe/{name}"), "name", "1", name])
+        .output()?;
+    let output = Command::new("mkfs.ext4")
+        .args([&format!("/dev/disk/by-partlabel/{name}")])
+        .output()?;
+    
     Ok(())
 }    
 
 async fn configure() -> Json<Message> {
-    let mut numpaths = fs::read_dir(format!("{NVMET_PATH}/ports")).unwrap().count();
+    let numpaths = fs::read_dir(format!("{NVMET_PATH}/ports")).unwrap().count();
     info!("numpaths is {}", numpaths);
 
     let mut last_port: &str = "0";
@@ -194,10 +212,10 @@ async fn configure() -> Json<Message> {
     let i = last_port.parse::<u32>().unwrap() + 1;
     info!("i is {}", i);
     
-    let uuid = Uuid::new_v4().to_string();
+    let uuid: String = Uuid::new_v4().to_string().replace("-", "");
     create_lv(&uuid, "1G").unwrap();
 
-    let lv_path = format!("/dev/abe/{uuid}");
+    let lv_path = lv_path_for_uuid(&uuid);
     
     let target = Subsystem::create(&uuid).await.unwrap();
     target.add_namespace("1", &lv_path).unwrap();
@@ -210,7 +228,11 @@ async fn configure() -> Json<Message> {
     port.link_subsystem(&target);
 
     println!("{} {}:{}", port.id, port.traddr, port.trsvcid);
-
+    let output = Command::new("ufw")
+        .args(["allow", &port.trsvcid])
+        .output().unwrap();
+    info!("{:?}", output);
+        
     Json(Message {
         message: format!("sudo nvme discover -a {} -t tcp -s {}; sudo nvme connect -a {} -t tcp -s {} -n {}",
 			 port.traddr,
