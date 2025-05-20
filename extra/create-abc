@@ -1,0 +1,101 @@
+#!/bin/sh -ex
+
+export VM_NAME="$1"
+export VM_ISO="/home/bmath/Downloads/debian-12.10.0-amd64-netinst.iso"
+export VM_URL="http://ftp.us.debian.org/debian/dists/stable/main/installer-amd64/"
+export VM_OS="debian12"
+export VM_IMG="./${VM_NAME}.qcow2"
+export VM_CORES=4
+export VM_DISKSIZE=20
+export VM_RAMSIZE=8192
+export VM_NET="default"
+
+cat<<CLIENT > ./client.sh
+#!/bin/bash -xe
+host=brick
+url=http://$host/configure
+
+sudo sh -c 'apt update && apt -y install curl nvme-cli nfs-kernel-server' || exit 1
+sudo modprobe nvmet
+
+response=`curl --silent "$VM_URL"`
+message=`echo $response | jq -r .message`
+
+while read line; do
+    result=`echo $line | bash`
+    id=`echo $line | awk '{print $NF}'`
+    device=`sudo /sbin/blkid -t PARTLABEL=$id | awk -F: '{print $1}'`
+    sudo mkdir -p /export/$id
+    sudo mount $device /export/$id
+    echo "/export/$id		*(rw,sync,fsid=0,no_root_squash,no_subtree_check)" | sudo tee -a /etc/exports
+    sudo exportfs -a
+done <<EOF
+$message
+CLIENT
+
+
+cat<<PRESEED >./abc.ks
+d-i debian-installer/locale string en_US
+d-i netcfg/choose_interface select auto
+d-i netcfg/get_hostname string abc
+d-i netcfg/get_domain string local
+d-i netcfg/hostname string abc
+d-i mirror/http/hostname string http.us.debian.org
+d-i passwd/root-password password root
+d-i passwd/user-fullname string ABC Admin
+d-i passwd/username string abc
+d-i passwd/user-password password abc
+d-i passwd/user-password-again password abc
+d-i passwd/user-default-groups string audio cdrom video sudo git sysprep HARDN
+d-i clock-setup/utc boolean true
+d-i time/zone string UTC
+d-i clock-setup/ntp boolean true
+d-i clock-setup/ntp-server string pool.ntp.org
+d-i partman-md/confirm boolean true
+d-i partman-partitioning/confirm_write_new_label boolean true
+d-i partman/choose_partition select finish
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+d-i partman/mount_style select label
+d-i base-installer/install-recommends boolean false
+d-i pkgsel/run_tasksel boolean true
+d-i pkgsel/include string openssh-server curl sudo virt-v2v jq git
+d-i pkgsel/upgrade select full-upgrade
+d-i grub-installer/only_debian boolean true
+d-i debian-installer/add-kernel-opts string nousb
+d-i finish-install/reboot_in_progress note
+d-i preseed/late_command string in-target
+PRESEED
+
+
+cat<<FIRSTBOOT > ./firstboot.sh
+chmod +x /client.sh
+git clone https://github.com/OpenSource-For-Freedom/HARDN.git
+cd HARDN
+dpkg-buildpackage -us -uc
+dpkg -i ../hardn_*.deb
+hardn
+FIRSTBOOT
+
+echo root > ./root
+sudo -E virt-install \
+--name ${VM_NAME} \
+--memory ${VM_RAMSIZE} \
+--vcpus ${VM_CORES} \
+--os-variant=${VM_OS} \
+--virt-type=kvm \
+--initrd-inject=./abc.ks \
+--extra-args="ks=file:/abc.ks console=ttyS0" \
+--network network=${VM_NET},model=virtio \
+--graphics none \
+--disk path=${VM_IMG},size=${VM_DISKSIZE},bus=virtio,format=qcow2 \
+--location ${VM_URL} \
+--unattended profile=jeos,user-login=abc,user-password-file=./admin,admin-password-file=./root \
+--memballoon none \
+--noautoconsole \
+--transient \
+--wait -1
+
+#sudo virsh shutdown ${VM_NAME} ; /usr/bin/sleep 10 ; sudo virsh destroy ${VM_NAME}
+sudo virt-sysprep --copy-in ./client.sh:/root --firstboot ./firstboot.sh -a ${VM_NAME}.qcow2 && \
+sudo gzip ${VM_NAME}.qcow2
