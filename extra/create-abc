@@ -96,6 +96,5 @@ sudo -E virt-install \
 --transient \
 --wait -1
 
-#sudo virsh shutdown ${VM_NAME} ; /usr/bin/sleep 10 ; sudo virsh destroy ${VM_NAME}
 sudo virt-sysprep --copy-in ./client.sh:/root --firstboot ./firstboot.sh -a ${VM_NAME}.qcow2 && \
 sudo gzip ${VM_NAME}.qcow2
