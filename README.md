@@ -5,7 +5,7 @@ Block
 Exporter
 ========
 
-![Logo](./logo.svgz)
+![Logo](./logo.svg)
 
 
 Abe makes it easy to export disk over the NVMe protocol.
