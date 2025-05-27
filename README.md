@@ -5,6 +5,9 @@ Block
 Exporter
 ========
 
+![Logo](./logo.svgz)
+
+
 Abe makes it easy to export disk over the NVMe protocol.
 
 Abe listens for connection requests, and then exports requested block device
