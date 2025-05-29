@@ -1,0 +1,9 @@
+[Unit]
+Description=ABE Client
+After=network.target nss-user-lookup.target auditd.service
+
+[Service]
+ExecStart=/root/client.sh
+
+[Install]
+WantedBy=multi-user.target
