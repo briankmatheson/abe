@@ -59,4 +59,5 @@ virt-install -n abc --memory 1024 --vcpus 4 --import --disk /var/lib/libvirt/ima
 ```
 
 will create a vm called abc with the specified parameters and boot
-that disk image.
+that disk image.  The resulting vm will connect to and export storage
+at /export/nfs.
