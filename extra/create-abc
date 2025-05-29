@@ -2,26 +2,17 @@
 #
 # ABE Block Client Image Builder
 
-export VM_NAME="$1"
+export VM_NAME="abc"
 export VM_ISO="/home/bmath/Downloads/debian-12.10.0-amd64-netinst.iso"
 export VM_URL="http://ftp.us.debian.org/debian/dists/stable/main/installer-amd64/"
 export VM_OS="debian12"
 export VM_IMG="./${VM_NAME}.qcow2"
 export VM_CORES=4
 export VM_DISKSIZE=20
-export VM_RAMSIZE=8192
+export VM_RAMSIZE=1024
 export VM_NET="default"
 export HARDN="https://github.com/OpenSource-For-Freedom/HARDN.git"
-export PACKAGES="
-openssh-server
-curl
-sudo
-virt-v2v
-jq
-git
-build-essential
-git-buildpackage
-"
+export PACKAGES="openssh-server curl sudo"
 
 cat<<PRESEED >./abc.ks
 d-i debian-installer/locale string en_US
@@ -54,15 +45,21 @@ d-i debian-installer/add-kernel-opts string nousb
 d-i finish-install/reboot_in_progress note
 PRESEED
 
-
 cat<<FIRSTBOOT > ./firstboot.sh
-apt update && apt -y upgrade && apt -y install ${PACKAGES}
+#!/bin/sh -xe
+export DEBIAN_FRONTEND=noninteractive
+cd /root
+apt update && apt -y upgrade
+apt -y install ${PACKAGES}
 chmod +x /root/client.sh
-git clone -b dev-testing ${HARDN} 
-cd HARDN
-dpkg-buildpackage -us -uc
-apt -y --fix-broken install ../hardn_*.deb
-hardn
+systemctl daemon-reload
+systemctl enable abc
+
+curl -LO https://raw.githubusercontent.com/OpenSource-For-Freedom/HARDN-XDR/main/src/setup/hardn-main.sh
+bash ./hardn-main.sh
+ufw allow nfs
+reboot
+
 FIRSTBOOT
 
 echo root > ./root
@@ -84,5 +81,5 @@ sudo -E virt-install \
 --transient \
 --wait -1
 
-sudo virt-sysprep --copy-in ./client.sh:/root --firstboot ./firstboot.sh -a ${VM_NAME}.qcow2
+sudo virt-sysprep --copy-in ./client.sh:/root --copy-in ./abc.service:/lib/systemd/system --firstboot ./firstboot.sh -a ${VM_NAME}.qcow2
 #sudo gzip ${VM_NAME}.qcow2

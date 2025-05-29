@@ -1,3 +1,4 @@
+use if_addrs::get_if_addrs;
 use nix::libc::int16_t;
 use nix::mount::{MsFlags, mount};
 use nix::unistd::symlinkat;
@@ -26,7 +27,6 @@ use serde::{Deserialize, Serialize};
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
-const PREFIX: &str = "172.23.23.0/24";
 const VOL_SIZE: &str = "100G";
 
 //env_inventory::register!(RUST_LOG = "info")
@@ -279,8 +279,13 @@ async fn main() {
         .route("/echo", post(echo))
         .route("/configure", get(configure));
 
-    let addr = SocketAddr::from(([192, 168, 1, 24], 80));
-    println!("Listening on http://{}", addr);
-    let listener = tokio::net::TcpListener::bind("192.168.1.24:80").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:80").await.unwrap();
+    if let Ok(addrs) = get_if_addrs() {
+        for iface in addrs {
+            if iface.ip().is_ipv4() && !iface.is_loopback() {
+		println!("Listening on http://{}", iface.ip());
+	    }
+	}
+    }
     axum::serve(listener, app).await.unwrap();
 }
