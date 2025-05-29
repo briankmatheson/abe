@@ -28,7 +28,7 @@ while read line; do
     device=`/sbin/blkid -t PARTLABEL=$id | awk -F: '{print $1}'`
     mkdir -p /export/nfs && \
     mount $device /export/nfs && \
-    echo "/export/nfs		*(rw,sync,no_root_squash,no_subtree_check)" | tee /etc/exports
+    echo "/export/nfs		*(mp,rw,sync,no_root_squash,no_subtree_check)" | tee /etc/exports
     exportfs -a
     echo $id | tee ~/.abe
 done <<EOF
