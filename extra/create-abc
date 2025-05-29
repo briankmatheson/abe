@@ -5,7 +5,7 @@
 export VM_NAME="abc"
 export VM_ISO="/home/bmath/Downloads/debian-12.10.0-amd64-netinst.iso"
 export VM_URL="http://ftp.us.debian.org/debian/dists/stable/main/installer-amd64/"
-export VM_OS="debian12"
+export VM_OS="debian11"
 export VM_IMG="./${VM_NAME}.qcow2"
 export VM_CORES=4
 export VM_DISKSIZE=20
