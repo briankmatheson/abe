@@ -79,6 +79,7 @@ sudo -E virt-install \
 --memballoon none \
 --noautoconsole \
 --transient \
+--check disk_size=off \
 --wait -1
 
 sudo virt-sysprep --copy-in ./client.sh:/root --copy-in ./abc.service:/lib/systemd/system --firstboot ./firstboot.sh -a ${VM_NAME}.qcow2
