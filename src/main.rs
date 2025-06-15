@@ -1,7 +1,8 @@
 use if_addrs::get_if_addrs;
-use nix::libc::int16_t;
+use nix::libc::{int16_t, SYS_userfaultfd};
 use nix::mount::{MsFlags, mount};
 use nix::unistd::symlinkat;
+use rcgen::{ExtendedKeyUsagePurpose, DnType, DnValue, DistinguishedName, CertificateParams, KeyPair};
 use std::path::PathBuf;
 use std::fs::{self, File, write};
 use std::io::{Result, Write, Read, Error, ErrorKind};
@@ -22,29 +23,40 @@ use axum::{
     Json, Router
 };
 use serde::{Deserialize, Serialize};
+use tokio_multi_proxy::start_mtls_tcp;
+
+
 //use env_inventory;
 
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
 const VOL_SIZE: &str = "100G";
+const CA_NAME: &str = "ABE-CA";
 
 //env_inventory::register!(RUST_LOG = "info")
 
 #[derive(Serialize, Deserialize)]
+struct Auth {
+    ca: String,
+    cert: String,
+    key: String
+}
+
+#[derive(Serialize, Deserialize)]
 struct Message {
-    message: String,
+    auth: Auth,
+    command: String
 }
 
-async fn hello() -> Json<Message> {
+async fn ping() -> Json<Message> {
     Json(Message {
-        message: "Hello, world!".to_string(),
-    })
-}
-
-async fn echo(Json(payload): Json<Message>) -> Json<Message> {
-    Json(Message {
-        message: format!("Echo: {}", payload.message),
+	auth: Auth{
+	    ca: "".to_string(),
+	    cert: "".to_string(),
+	    key: "".to_string()
+	},
+        command: "ping".to_string(),
     })
 }
 
@@ -85,19 +97,32 @@ async fn do_attach(id: String) -> Json<Message> {
 
     let svc_port = format!("44{:03}", i);
     info!("svc_port is {svc_port}");
-	
+    
 
     let port  = Port::create(id.clone(), &svc_port, "tcp", i).unwrap();
     port.link_subsystem(&target);
-	
+    port.create_server_cert();
+    port.create_client_cert();
+    port.start_proxy(&format!("{id}.server.pem"), &format!("{id}.server.key"));
+    
     println!("{} {}:{}", port.id, port.traddr, port.trsvcid);
     let output = Command::new("ufw")
         .args(["allow", &port.trsvcid])
         .output().unwrap();
     info!("{:?}", output);
+
+    let ca_pem = fs::read_to_string("ca.pem").unwrap();
+    let server_pem = fs::read_to_string(format!("{id}.server.pem")).unwrap();
+    let server_key = fs::read_to_string(format!("{id}.server.key")).unwrap();
+    let auth = Auth{
+	ca: ca_pem,
+	cert: server_pem,
+	key: server_key
+    };
     
     Json(Message {
-        message: format!("sudo nvme discover -a {} -t tcp -s {}; sudo nvme connect -a {} -t tcp -s {} -n {}",
+	auth: auth,
+        command: format!("sudo nvme discover -a {} -t tcp -s {}; sudo nvme connect -a {} -t tcp -s {} -n {}",
 			 port.traddr,
 			 port.trsvcid,
 			 port.traddr,
@@ -105,6 +130,27 @@ async fn do_attach(id: String) -> Json<Message> {
 			 id),
     })
 }
+
+fn create_ca() -> Result <()> {
+    let key = KeyPair::generate().unwrap();
+    let subject_alt_names = vec![CA_NAME.to_string()];
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, DnValue::PrintableString(CA_NAME.try_into().unwrap()));
+    let mut cert = CertificateParams::new(vec![CA_NAME.to_string().clone()]).unwrap();
+    cert.distinguished_name = dn;
+    cert.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    cert.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ]; 
+    
+    let mut k = File::create("ca.key").unwrap();
+    let mut c = File::create("ca.pem").unwrap();
+    k.write_all(&key.serialize_pem().into_bytes());
+    c.write_all(&cert.self_signed(&key).unwrap().pem().into_bytes());
+    Ok(())
+}
+
 
 // NVME over TCP target subsystem
 struct Subsystem {
@@ -153,7 +199,7 @@ impl Port {
         let path = format!("{}/ports/{}", NVMET_PATH, iteration);
 
         info!("making port {path}");
-	let traddr: String = "192.168.1.24".to_string();
+	let traddr: String = "127.0.0.1".to_string();
 	let mut trsvcid: String = svcid.to_string();
         let result = fs::create_dir_all(&path);
 	if result.is_ok() {
@@ -181,7 +227,6 @@ impl Port {
 	    iteration: iteration
 	})
     }
-    
     fn link_subsystem(&self, subsystem: &Subsystem) -> Result<()> {
         let subsys_path: String = format!("{}/subsystems/{}", NVMET_PATH, subsystem.name);
         let port_subsys_link: String = format!(
@@ -193,7 +238,61 @@ impl Port {
 
         Ok(())
     }
+    fn create_server_cert(&self) -> Result<()> {
+	let server_key = KeyPair::generate().unwrap();
+	let ca_key_pem = fs::read_to_string("ca.key").unwrap();
+	let ca_pem = fs::read_to_string("ca.pem").unwrap();
+	let ca_key = KeyPair::from_pem(&ca_key_pem).unwrap();
+	let ca = CertificateParams::from_ca_cert_pem(&ca_pem).unwrap().
+	    self_signed(&ca_key).unwrap();
+	
+	let mut dn = DistinguishedName::new();
+	dn.push(DnType::CommonName, DnValue::PrintableString(self.id.clone().try_into().unwrap()));
+	
+	let mut cert = CertificateParams::new(vec![self.id.to_string()].clone()).unwrap();
+	cert.distinguished_name = dn.clone();
 
+	let file_name = &self.id;
+	let mut s = File::create(format!("{}.server.pem", &file_name)).unwrap();
+	let mut sk = File::create(format!("{}.server.key", &file_name)).unwrap();
+	s.write_all(&cert.signed_by(&server_key, &ca, &ca_key).unwrap().pem().into_bytes())?;
+	sk.write_all(&server_key.serialize_pem().into_bytes())?;
+	Ok(())
+    }
+
+    fn create_client_cert(&self) -> Result<()> {
+	let client_key = KeyPair::generate().unwrap();
+	let ca_key_pem = fs::read_to_string("ca.key").unwrap();
+	let ca_pem = fs::read_to_string("ca.pem").unwrap();
+	let ca_key = KeyPair::from_pem(&ca_key_pem).unwrap();
+	let ca = CertificateParams::from_ca_cert_pem(&ca_pem).unwrap().
+	    self_signed(&ca_key).unwrap();
+	
+	let mut dn = DistinguishedName::new();
+	dn.push(DnType::CommonName, DnValue::PrintableString(self.id.clone().try_into().unwrap()));
+	
+	
+	let mut cert = CertificateParams::new(vec![self.id.to_string()].clone()).unwrap();
+	cert.distinguished_name = dn.clone();
+	cert.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+	
+	
+	
+	let file_name = &self.id;
+	let mut c = File::create(format!("{}.client.pem", &file_name)).unwrap();
+	let mut ck = File::create(format!("{}.client.key", &file_name)).unwrap();
+	c.write_all(&cert.signed_by(&client_key, &ca, &ca_key).unwrap().pem().into_bytes())?;
+	ck.write_all(&client_key.serialize_pem().into_bytes())?;
+	Ok(())
+    }
+    
+    async fn start_proxy(&self, server_key_filename: &String, server_cert_filename: &String) -> Result<()> {
+	start_mtls_tcp("0.0.0.0:{self.trsvcid}",
+		       "127.0.0.1:{self.trsvcid}",
+		       "ca.pem", server_key_filename, server_cert_filename).await;
+	Ok(())
+    }
+    
 }
 
 fn ensure_configfs_mounted() -> Result<()> {
@@ -213,10 +312,6 @@ fn ensure_configfs_mounted() -> Result<()> {
     Ok(())
 }
 
-fn ensure_dummy0_present() -> Result<()> {
-
-    Ok(())
-}
 
 fn lv_path_for_uuid(uuid: &str) ->  String {
     let s: String = format!("/dev/abe/{uuid}");
@@ -269,16 +364,14 @@ pub fn create_lv(name: &str, size: &str) -> Result<()> {
 #[tokio::main]
 async fn main() {
     env_logger::init();
-    
+    create_ca();
     ensure_configfs_mounted();
     ensure_nvmet_present();
 
     let app = Router::new()
+        .route("/ping", get(ping))
         .route("/id/:id", get(attach))
-        .route("/hello", get(hello))
-        .route("/echo", post(echo))
         .route("/configure", get(configure));
-
     let listener = tokio::net::TcpListener::bind("0.0.0.0:80").await.unwrap();
     if let Ok(addrs) = get_if_addrs() {
         for iface in addrs {
@@ -289,3 +382,4 @@ async fn main() {
     }
     axum::serve(listener, app).await.unwrap();
 }
+ 
