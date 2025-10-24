@@ -50,7 +50,7 @@ async fn echo(Json(payload): Json<Message>) -> Json<Message> {
 
 async fn configure() -> Json<Message> {
     let id: String = Uuid::new_v4().to_string().replace("-", "");
-    create_lv(&id, VOL_SIZE).unwrap(); 
+    create_lv(&id, VOL_SIZE);
     info!("attach id is {}", id); 
     do_attach(id).await
 }
@@ -91,13 +91,13 @@ async fn do_attach(id: String) -> Json<Message> {
     port.link_subsystem(&target);
 	
     println!("{} {}:{}", port.id, port.traddr, port.trsvcid);
-    let output = Command::new("ufw")
+    let output = Command::new("/usr/sbin/ufw")
         .args(["allow", &port.trsvcid])
         .output().unwrap();
     info!("{:?}", output);
     
     Json(Message {
-        message: format!("sudo nvme discover -a {} -t tcp -s {}; sudo nvme connect -a {} -t tcp -s {} -n {}",
+        message: format!("sudo nvme discover -a {} -t tcp -s {} ; sudo nvme connect -a {} -t tcp -s {} -n {}",
 			 port.traddr,
 			 port.trsvcid,
 			 port.traddr,
@@ -151,9 +151,8 @@ struct Port {
 impl Port {
     fn create(id: String, svcid: &str, trtype: &str, iteration: u32) -> Result<Port> {    
         let path = format!("{}/ports/{}", NVMET_PATH, iteration);
-
         info!("making port {path}");
-	let traddr: String = "192.168.1.24".to_string();
+	let traddr: String = dbg!("172.23.254.254").to_string();
 	let mut trsvcid: String = svcid.to_string();
         let result = fs::create_dir_all(&path);
 	if result.is_ok() {
@@ -213,11 +212,6 @@ fn ensure_configfs_mounted() -> Result<()> {
     Ok(())
 }
 
-fn ensure_dummy0_present() -> Result<()> {
-
-    Ok(())
-}
-
 fn lv_path_for_uuid(uuid: &str) ->  String {
     let s: String = format!("/dev/abe/{uuid}");
     s
@@ -236,11 +230,12 @@ fn ensure_nvmet_present() -> Result<()> {
 
 pub fn create_lv(name: &str, size: &str) -> Result<()> {
     info!("making lv {name}");
-    let output = Command::new("lvcreate")
+    let output = Command::new("/usr/sbin/lvcreate")
         .args(["-y", "-W", "y", "-L", size, "-n", name, "abe"])
         .output()?;
 
     if !output.status.success() {
+        info!("Boo!");
         return Err(Error::new(
             ErrorKind::Other,
             format!(
@@ -249,19 +244,23 @@ pub fn create_lv(name: &str, size: &str) -> Result<()> {
             ),
         ));
     }
-    let output = Command::new("parted")
+    info!("labeling lv {name}");
+    let output = Command::new("/usr/sbin/parted")
         .args([&format!("/dev/abe/{name}"), "mklabel", "gpt"])
         .output()?;
-    let output = Command::new("parted")
+    info!("create partition on lv {name}");
+    let output = Command::new("/usr/sbin/parted")
         .args([&format!("/dev/abe/{name}"), "mkpart", "primary", "0%", "100%"])
         .output()?;
-    let output = Command::new("parted")
+    info!("naming lv {name}");
+    let output = Command::new("/usr/sbin/parted")
         .args([&format!("/dev/abe/{name}"), "name", "1", name])
         .output()?;
-    let output = Command::new("mkfs.ext4")
+    info!("formatting partition on lv {name}");
+    let output = Command::new("/usr/sbin/mkfs.ext4")
         .args([&format!("/dev/disk/by-partlabel/{name}")])
         .output()?;
-    
+    info!("Done!");
     Ok(())
 }    
 
