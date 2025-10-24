@@ -34,18 +34,8 @@ const VOL_SIZE: &str = "100G";
 #[derive(Serialize, Deserialize)]
 struct Message {
     message: String,
-}
-
-async fn hello() -> Json<Message> {
-    Json(Message {
-        message: "Hello, world!".to_string(),
-    })
-}
-
-async fn echo(Json(payload): Json<Message>) -> Json<Message> {
-    Json(Message {
-        message: format!("Echo: {}", payload.message),
-    })
+    id: String,
+    port: String,
 }
 
 async fn configure() -> Json<Message> {
@@ -103,6 +93,10 @@ async fn do_attach(id: String) -> Json<Message> {
 			 port.traddr,
 			 port.trsvcid,
 			 id),
+        
+        id: id,
+        port: port.trsvcid,
+        
     })
 }
 
@@ -274,8 +268,6 @@ async fn main() {
 
     let app = Router::new()
         .route("/id/:id", get(attach))
-        .route("/hello", get(hello))
-        .route("/echo", post(echo))
         .route("/configure", get(configure));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:80").await.unwrap();
