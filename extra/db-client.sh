@@ -9,7 +9,10 @@ fi
 
 
 install(){
-    sh -c 'apt update && apt -y install sudo curl jq nvme-cli nfs-kernel-server mdadm' || exit 1
+    sh -c 'apt update && apt -y install sudo curl jq nvme-cli nfs-kernel-server mdadm cryptsetup parted ufw' || exit 1
+    ufw allow ssh
+    ufw allow 80
+    ufw enable
 }
 
 
@@ -35,7 +38,7 @@ if [ -z "$one" -o -z "$two" -o -z "$three" ]; then
 	    port=`echo $response | jq -r .port`
 	    id=`echo $response | jq -r .id`
 	    #result=`sudo nvme connect -a $server -t tcp -s $port -n $id`
-	    echo -n ${1}:${port}:${id} ' ' >> ~/.abe
+	    echo -n ${server}:${port}:${id} ' ' >> ~/.abe
         done
         echo >> ~/.abe
         
@@ -54,17 +57,25 @@ if [ -s ~/.abe ]; then
     md_devs=""
     for drive_id in $one $two $three; do
 	server_address=`echo $drive_id | tr : ' ' | awk '{print $1}'`
-	port=`echo $drive_id | tr : ' ' | awk '{print $2}'`
 	block_id=`echo $drive_id | tr : ' ' | awk '{print $3}'`
+	url=http://$server_address/id/$block_id
+	response=`curl --silent "$url"`
+	port=`echo $response | jq -r .port`
+
 	result=`sudo nvme connect -a $server_address -t tcp -s $port -n $block_id`
+        sleep 1
         device=`/sbin/blkid -t PARTLABEL=$block_id | awk -F: '{print $1}'`
  	md_devs="$device $md_devs"
     done
     mdadm --create /dev/md0 --level=1 --raid-devices=3 $md_devs
-    mkfs.ext4 /dev/md0
-    mkdir -p /var/lib/postrgresql
-    mount /dev/md0 /var/lib/postgresql
+    #cryptsetup -y -v luksFormat /dev/md0
+    cryptsetup -v luksOpen /dev/md0 abe
+    #mkfs.ext4 /dev/mapper/abe
+    mkdir -p /var/lib/postgresql
+    mount /dev/mapper/abe /var/lib/postgresql
     apt install -y postgresql
+    systemctl start postgresql
+    systemctl status postgresql
 else
     exit 1
 fi
