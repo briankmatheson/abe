@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
-const VOL_SIZE: &str = "100G";
+const VOL_SIZE: &str = "10G";
 
 //env_inventory::register!(RUST_LOG = "info")
 
@@ -250,10 +250,6 @@ pub fn create_lv(name: &str, size: &str) -> Result<()> {
     info!("naming lv {name}");
     let output = Command::new("/usr/sbin/parted")
         .args([&format!("/dev/abe/{name}"), "name", "1", name])
-        .output()?;
-    info!("formatting partition on lv {name}");
-    let output = Command::new("/usr/sbin/mkfs.ext4")
-        .args([&format!("/dev/disk/by-partlabel/{name}")])
         .output()?;
     info!("Done!");
     Ok(())

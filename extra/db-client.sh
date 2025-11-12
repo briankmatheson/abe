@@ -11,7 +11,6 @@ fi
 install(){
     sh -c 'apt update && apt -y install sudo curl jq nvme-cli nfs-kernel-server mdadm cryptsetup parted ufw' || exit 1
     ufw allow ssh
-    ufw allow 80
     ufw enable
 }
 
@@ -68,13 +67,19 @@ if [ -s ~/.abe ]; then
  	md_devs="$device $md_devs"
     done
     mdadm --create /dev/md0 --level=1 --raid-devices=3 $md_devs
-    #cryptsetup -y -v luksFormat /dev/md0
-    cryptsetup -v luksOpen /dev/md0 abe
-    #mkfs.ext4 /dev/mapper/abe
+    
+    cryptsetup -v luksOpen /dev/md0 abe || setup=1
+    if [ "$setup" -ne 0 ]; then
+        cryptsetup -y -v luksFormat /dev/md0
+        cryptsetup -v luksOpen /dev/md0 abe
+        mkfs.ext4 /dev/mapper/abe
+    fi
+    
     mkdir -p /var/lib/postgresql
     mount /dev/mapper/abe /var/lib/postgresql
     apt install -y postgresql
     systemctl start postgresql
+    sed -i 's/listen_addresses.*/listen_address = \'*\'/' /etc/postgresql/17/main/postgresql.conf #'
     systemctl status postgresql
 else
     exit 1
