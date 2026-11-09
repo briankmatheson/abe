@@ -1,0 +1,476 @@
+use axum::{
+    extract::{Path as EP, State},
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+    Json, Router,
+};
+use log::{info, warn, error};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{Error, ErrorKind, Read, Result, Write};
+use std::path::Path;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
+
+const CONFIGFS_PATH: &str = "/sys/kernel/config";
+const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
+
+#[derive(Clone)]
+struct AppState {
+    config: Config,
+    volumes: Arc<Mutex<HashMap<Uuid, VolumeInfo>>>,
+    port_counter: Arc<Mutex<u16>>,
+}
+
+#[derive(Clone, Deserialize)]
+struct Config {
+    #[serde(default = "default_listen")]
+    listen_addr: String,
+    #[serde(default = "default_vg")]
+    volume_group: String,
+    #[serde(default = "default_token_file")]
+    token_file: String,
+    #[serde(default = "default_size")]
+    default_size_gib: u64,
+    #[serde(default = "default_max_size")]
+    max_size_gib: u64,
+    #[serde(default = "default_port_start")]
+    port_range_start: u16,
+    #[serde(default = "default_port_end")]
+    port_range_end: u16,
+}
+
+fn default_listen() -> String { "0.0.0.0:7080".into() }
+fn default_vg() -> String { "abe".into() }
+fn default_token_file() -> String { "/etc/abe/token".into() }
+fn default_size() -> u64 { 10 }
+fn default_max_size() -> u64 { 1000 }
+fn default_port_start() -> u16 { 4420 }
+fn default_port_end() -> u16 { 4520 }
+
+#[derive(Clone, Serialize)]
+struct VolumeInfo {
+    id: Uuid,
+    size_gib: u64,
+    nvme_port: u16,
+    ip_addr: String,
+    created_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CreateVolumeRequest {
+    #[serde(default)]
+    size_gib: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct VolumeResponse {
+    id: String,
+    size_gib: u64,
+    nvme_port: u16,
+    connect_command: String,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+// Authentication middleware
+async fn auth<B>(
+    State(state): State<AppState>,
+    req: Request<B>,
+    next: Next<B>,
+) -> Result<Response, StatusCode> {
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let expected = std::fs::read_to_string(&state.config.token_file)
+        .map_err(|e| {
+            error!("Failed to read token file: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if token != expected.trim() {
+        warn!("Invalid token attempt");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    Ok(next.run(req).await)
+}
+
+// Validate UUID format
+fn validate_uuid(id: &str) -> Result<Uuid> {
+    Uuid::parse_str(id).map_err(|e| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid UUID format: {}", e),
+        )
+    })
+}
+
+// Create a new volume
+async fn create_volume(
+    State(state): State<AppState>,
+    Json(req): Json<CreateVolumeRequest>,
+) -> Result<Json<VolumeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let size_gib = req.size_gib.unwrap_or(state.config.default_size_gib);
+    
+    if size_gib > state.config.max_size_gib {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("size exceeds maximum of {}GiB", state.config.max_size_gib),
+            }),
+        ));
+    }
+
+    let id = Uuid::new_v4();
+    info!("Creating volume {} with size {}GiB", id, size_gib);
+
+    // Create LV
+    create_lv(&state.config.volume_group, &id.to_string(), size_gib)
+        .map_err(|e| {
+            error!("Failed to create LV: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to create volume: {}", e),
+                }),
+            )
+        })?;
+
+    // Get next port
+    let port = {
+        let mut counter = state.port_counter.lock().unwrap();
+        let p = *counter;
+        *counter += 1;
+        if *counter > state.config.port_range_end {
+            *counter = state.config.port_range_start;
+        }
+        p
+    };
+
+    // Set up NVMe-oF export
+    let ip_addr = get_ip_address().unwrap_or_else(|| "0.0.0.0".to_string());
+    setup_nvmeof(&state.config.volume_group, &id, port, &ip_addr)
+        .map_err(|e| {
+            error!("Failed to setup NVMe-oF: {}", e);
+            // Cleanup LV on failure
+            let _ = delete_lv(&state.config.volume_group, &id.to_string());
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to setup NVMe-oF: {}", e),
+                }),
+            )
+        })?;
+
+    // Store volume info
+    let vol_info = VolumeInfo {
+        id,
+        size_gib,
+        nvme_port: port,
+        ip_addr: ip_addr.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state.volumes.lock().unwrap().insert(id, vol_info);
+
+    let connect_cmd = format!(
+        "sudo nvme discover -a {} -t tcp -s {} && sudo nvme connect -a {} -t tcp -s {} -n {}",
+        ip_addr, port, ip_addr, port, id.as_hyphenated()
+    );
+
+    Ok(Json(VolumeResponse {
+        id: id.to_string(),
+        size_gib,
+        nvme_port: port,
+        connect_command: connect_cmd,
+    }))
+}
+
+// List all volumes
+async fn list_volumes(
+    State(state): State<AppState>,
+) -> Json<Vec<VolumeInfo>> {
+    let volumes = state.volumes.lock().unwrap();
+    Json(volumes.values().cloned().collect())
+}
+
+// Get specific volume
+async fn get_volume(
+    State(state): State<AppState>,
+    EP(id): EP<String>,
+) -> Result<Json<VolumeInfo>, (StatusCode, Json<ErrorResponse>)> {
+    let uuid = validate_uuid(&id).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    let volumes = state.volumes.lock().unwrap();
+    volumes
+        .get(&uuid)
+        .cloned()
+        .map(Json)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "volume not found".into(),
+                }),
+            )
+        })
+}
+
+// Delete volume
+async fn delete_volume(
+    State(state): State<AppState>,
+    EP(id): EP<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let uuid = validate_uuid(&id).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+
+    info!("Deleting volume {}", uuid);
+
+    // Remove from tracking
+    let vol_info = state
+        .volumes
+        .lock()
+        .unwrap()
+        .remove(&uuid)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "volume not found".into(),
+                }),
+            )
+        })?;
+
+    // Cleanup NVMe-oF
+    cleanup_nvmeof(&uuid, vol_info.nvme_port).map_err(|e| {
+        error!("Failed to cleanup NVMe-oF: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("failed to cleanup NVMe-oF: {}", e),
+            }),
+        )
+    })?;
+
+    // Delete LV
+    delete_lv(&state.config.volume_group, &uuid.to_string()).map_err(|e| {
+        error!("Failed to delete LV: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("failed to delete volume: {}", e),
+            }),
+        )
+    })?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// Health check
+async fn health() -> &'static str {
+    "OK"
+}
+
+// LVM operations
+fn create_lv(vg: &str, name: &str, size_gib: u64) -> Result<()> {
+    let size = format!("{}G", size_gib);
+    info!("Creating LV {}/{} with size {}", vg, name, size);
+
+    let output = Command::new("lvcreate")
+        .args(["-y", "-W", "y", "-L", &size, "-n", name, vg])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!(
+                "lvcreate failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn delete_lv(vg: &str, name: &str) -> Result<()> {
+    info!("Deleting LV {}/{}", vg, name);
+
+    let output = Command::new("lvremove")
+        .args(["-y", &format!("{}/{}", vg, name)])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!(
+                "lvremove failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+// NVMe-oF operations
+fn setup_nvmeof(vg: &str, id: &Uuid, port: u16, ip: &str) -> Result<()> {
+    let nqn = id.as_hyphenated().to_string();
+    let subsys_path = format!("{}/subsystems/{}", NVMET_PATH, nqn);
+    let port_path = format!("{}/ports/{}", NVMET_PATH, port);
+    let device_path = format!("/dev/{}/{}", vg, id);
+
+    // Create subsystem
+    fs::create_dir_all(&subsys_path)?;
+    fs::write(format!("{}/attr_allow_any_host", subsys_path), "1")?;
+
+    // Create namespace
+    let ns_path = format!("{}/namespaces/1", subsys_path);
+    fs::create_dir_all(&ns_path)?;
+    fs::write(format!("{}/device_path", ns_path), device_path.as_bytes())?;
+    fs::write(format!("{}/enable", ns_path), b"1")?;
+
+    // Create port
+    fs::create_dir_all(&port_path)?;
+    fs::write(format!("{}/addr_traddr", port_path), ip.as_bytes())?;
+    fs::write(format!("{}/addr_trsvcid", port_path), port.to_string().as_bytes())?;
+    fs::write(format!("{}/addr_trtype", port_path), b"tcp")?;
+    fs::write(format!("{}/addr_adrfam", port_path), b"ipv4")?;
+
+    // Link subsystem to port
+    let link_path = format!("{}/subsystems/{}", port_path, nqn);
+    std::os::unix::fs::symlink(&subsys_path, &link_path)?;
+
+    Ok(())
+}
+
+fn cleanup_nvmeof(id: &Uuid, port: u16) -> Result<()> {
+    let nqn = id.as_hyphenated().to_string();
+    let subsys_path = format!("{}/subsystems/{}", NVMET_PATH, nqn);
+    let port_path = format!("{}/ports/{}", NVMET_PATH, port);
+
+    // Remove link
+    let link_path = format!("{}/subsystems/{}", port_path, nqn);
+    let _ = fs::remove_file(&link_path);
+
+    // Disable namespace
+    let ns_path = format!("{}/namespaces/1", subsys_path);
+    let _ = fs::write(format!("{}/enable", ns_path), b"0");
+
+    // Remove namespace
+    let _ = fs::remove_dir(&ns_path);
+
+    // Remove subsystem
+    let _ = fs::remove_dir(&subsys_path);
+
+    // Remove port
+    let _ = fs::remove_dir(&port_path);
+
+    Ok(())
+}
+
+fn get_ip_address() -> Option<String> {
+    use if_addrs::get_if_addrs;
+    
+    get_if_addrs().ok()?.into_iter()
+        .find(|iface| iface.ip().is_ipv4() && !iface.is_loopback())
+        .map(|iface| iface.ip().to_string())
+}
+
+fn ensure_configfs_mounted() -> Result<()> {
+    if !Path::new(CONFIGFS_PATH).exists() {
+        info!("Mounting configfs...");
+        use nix::mount::{mount, MsFlags};
+        mount::<str, str, str, str>(
+            Some("none"),
+            CONFIGFS_PATH,
+            Some("configfs"),
+            MsFlags::empty(),
+            None,
+        ).map_err(|e| Error::new(ErrorKind::Other, format!("mount failed: {}", e)))?;
+    }
+    Ok(())
+}
+
+fn ensure_nvmet_present() -> Result<()> {
+    if !Path::new(NVMET_PATH).exists() {
+        info!("Loading nvmet kernel module...");
+        Command::new("modprobe").arg("nvmet").output()?;
+        Command::new("modprobe").arg("nvmet-tcp").output()?;
+    }
+    Ok(())
+}
+
+fn load_config() -> Config {
+    std::fs::read_to_string("/etc/abe/config.toml")
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_else(|| Config {
+            listen_addr: default_listen(),
+            volume_group: default_vg(),
+            token_file: default_token_file(),
+            default_size_gib: default_size(),
+            max_size_gib: default_max_size(),
+            port_range_start: default_port_start(),
+            port_range_end: default_port_end(),
+        })
+}
+
+#[tokio::main]
+async fn main() {
+    env_logger::init();
+
+    info!("Starting ABE (Abe Block Exporter)");
+
+    ensure_configfs_mounted().expect("failed to mount configfs");
+    ensure_nvmet_present().expect("failed to load nvmet modules");
+
+    let config = load_config();
+    info!("Listening on {}", config.listen_addr);
+    info!("Using volume group: {}", config.volume_group);
+
+    let state = AppState {
+        config: config.clone(),
+        volumes: Arc::new(Mutex::new(HashMap::new())),
+        port_counter: Arc::new(Mutex::new(config.port_range_start)),
+    };
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/volumes", post(create_volume))
+        .route("/volumes", get(list_volumes))
+        .route("/volumes/:id", get(get_volume))
+        .route("/volumes/:id", delete(delete_volume))
+        .layer(middleware::from_fn_with_state(state.clone(), auth))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&config.listen_addr)
+        .await
+        .expect("failed to bind");
+
+    axum::serve(listener, app).await.expect("server failed");
+}
