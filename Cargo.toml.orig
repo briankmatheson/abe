@@ -1,0 +1,17 @@
+[package]
+name = "abe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.7"
+chrono = { version = "0.4", features = ["serde"] }
+env_logger = "0.11.8"
+if-addrs = "0.13.4"
+log = "0.4.27"
+nix = { version = "0.29.0", features = [ "default", "mount", "fs" ] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+uuid = { version = "1.16.0", features = [ "v4" ] }

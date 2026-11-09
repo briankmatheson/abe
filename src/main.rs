@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
-const VOL_SIZE: &str = "10G";
+const VOL_SIZE: &str = "100G";
 
 //env_inventory::register!(RUST_LOG = "info")
 
@@ -73,7 +73,7 @@ async fn do_attach(id: String) -> Json<Message> {
     let target = Subsystem::create(&id).await.unwrap();
     target.add_namespace("1", &lv_path).await.unwrap();
 
-    let svc_port = format!("4{:03}", i);
+    let svc_port = format!("44{:03}", i);
     info!("svc_port is {svc_port}");
 	
 
@@ -146,8 +146,7 @@ impl Port {
     fn create(id: String, svcid: &str, trtype: &str, iteration: u32) -> Result<Port> {    
         let path = format!("{}/ports/{}", NVMET_PATH, iteration);
         info!("making port {path}");
-
-	let traddr: String = dbg!(env::var("abe_ip").unwrap()).to_string();
+	let traddr: String = dbg!("172.23.254.254").to_string();
 	let mut trsvcid: String = svcid.to_string();
         let result = fs::create_dir_all(&path);
 	if result.is_ok() {
@@ -251,6 +250,10 @@ pub fn create_lv(name: &str, size: &str) -> Result<()> {
     let output = Command::new("/usr/sbin/parted")
         .args([&format!("/dev/abe/{name}"), "name", "1", name])
         .output()?;
+    info!("formatting partition on lv {name}");
+    let output = Command::new("/usr/sbin/mkfs.ext4")
+        .args([&format!("/dev/disk/by-partlabel/{name}")])
+        .output()?;
     info!("Done!");
     Ok(())
 }    
@@ -271,9 +274,7 @@ async fn main() {
     if let Ok(addrs) = get_if_addrs() {
         for iface in addrs {
             if iface.ip().is_ipv4() && !iface.is_loopback() {
-                let ip = &format!("{}", iface.ip());
-                std::env::set_var("abe_ip", ip);
-		println!("Listening on http://{}", env::var("abe_ip").unwrap());
+		println!("Listening on http://{}", iface.ip());
 	    }
 	}
     }

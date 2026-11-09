@@ -81,10 +81,10 @@ struct ErrorResponse {
 }
 
 // Authentication middleware
-async fn auth<B>(
+async fn auth(
     State(state): State<AppState>,
-    req: Request<B>,
-    next: Next<B>,
+    req: Request<axum::body::Body>,
+    next: Next,
 ) -> Result<Response, StatusCode> {
     let token = req
         .headers()

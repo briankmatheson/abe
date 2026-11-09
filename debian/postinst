@@ -1,0 +1,50 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Load kernel modules
+        modprobe nvmet 2>/dev/null || true
+        modprobe nvmet-tcp 2>/dev/null || true
+        
+        # Add modules to load on boot
+        if [ ! -f /etc/modules-load.d/abe.conf ]; then
+            cat > /etc/modules-load.d/abe.conf << 'EOF'
+nvmet
+nvmet-tcp
+EOF
+        fi
+        
+        # Reload systemd
+        systemctl daemon-reload || true
+        
+        echo ""
+        echo "⚠️  WARNING: ABE installed without authentication!"
+        echo ""
+        echo "This version of ABE does NOT include authentication."
+        echo "See /usr/share/doc/abe/SECURITY_AUDIT.md for security issues."
+        echo ""
+        echo "Before starting ABE, ensure you have:"
+        echo "  1. Created the LVM volume group 'abe'"
+        echo "     Example: pvcreate /dev/vdb && vgcreate abe /dev/vdb"
+        echo ""
+        echo "  2. Configured firewall to block external access"
+        echo "     Example: ufw allow from 10.0.0.0/8 to any port 80"
+        echo ""
+        echo "Then manually start if needed:"
+        echo "  systemctl start abe"
+        echo ""
+        ;;
+        
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+        
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

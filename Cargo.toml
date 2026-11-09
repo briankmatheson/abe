@@ -4,14 +4,33 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = "0.7"
-chrono = { version = "0.4", features = ["serde"] }
+cidr = "0.3.1"
 env_logger = "0.11.8"
-if-addrs = "0.13.4"
+ipnet = "2.11.0"
 log = "0.4.27"
 nix = { version = "0.29.0", features = [ "default", "mount", "fs" ] }
+uuid = { version = "1.16.0", features = [ "v4" ] }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["full"] }
-toml = "0.8"
-uuid = { version = "1.16.0", features = [ "v4" ] }
+env-inventory = "0.2.3"
+if-addrs = "0.13.4"
+
+[package.metadata.deb]
+maintainer = "Brian Matheson <brian@brianmatheson.com>"
+copyright = "2024, Brian Matheson <brian@brianmatheson.com>"
+section = "admin"
+priority = "optional"
+depends = "lvm2"
+extended-description = """
+ABE (Abe Block Exporter) is an NVMe-oF block storage server.
+
+WARNING: No authentication. Use only in trusted networks.
+"""
+assets = [
+    ["target/release/abe", "usr/bin/", "755"],
+    ["debian/abe.service", "usr/lib/systemd/system/", "644"],
+    ["SECURITY_AUDIT.md", "usr/share/doc/abe/", "644"],
+]
+maintainer-scripts = "debian/"

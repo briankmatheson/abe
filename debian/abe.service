@@ -1,0 +1,24 @@
+[Unit]
+Description=ABE (Abe Block Exporter) - NVMe-oF Block Storage Server
+Documentation=https://github.com/brianmatheson/abe
+After=network.target lvm2-lvmetad.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/abe
+Restart=always
+RestartSec=5
+Environment="RUST_LOG=info"
+
+# Security hardening
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/abe /sys/kernel/config /dev /run
+
+# Resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
