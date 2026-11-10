@@ -81,10 +81,10 @@ async fn do_attach(id: String) -> Json<Message> {
     port.link_subsystem(&target);
 	
     println!("{} {}:{}", port.id, port.traddr, port.trsvcid);
-    let output = Command::new("/usr/sbin/ufw")
-        .args(["allow", &port.trsvcid])
-        .output().unwrap();
-    info!("{:?}", output);
+    match Command::new("/usr/sbin/ufw").args(["allow", &port.trsvcid]).output() {
+        Ok(o) => info!("ufw allow {}: {}", port.trsvcid, o.status),
+        Err(e) => info!("ufw not available ({}); skipping firewall rule", e),
+    }
     
     Json(Message {
         message: format!("sudo nvme discover -a {} -t tcp -s {} ; sudo nvme connect -a {} -t tcp -s {} -n {}",
@@ -146,7 +146,9 @@ impl Port {
     fn create(id: String, svcid: &str, trtype: &str, iteration: u32) -> Result<Port> {    
         let path = format!("{}/ports/{}", NVMET_PATH, iteration);
         info!("making port {path}");
-	let traddr: String = dbg!("172.23.254.254").to_string();
+        // nvmet-tcp accepts 0.0.0.0 to listen on every interface; override
+        // with ABE_TRADDR to pin a specific one.
+        let traddr: String = std::env::var("ABE_TRADDR").unwrap_or_else(|_| "0.0.0.0".to_string());
 	let mut trsvcid: String = svcid.to_string();
         let result = fs::create_dir_all(&path);
 	if result.is_ok() {
