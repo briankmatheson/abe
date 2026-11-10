@@ -91,22 +91,45 @@ async fn attach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiErr
     do_attach(id).await
 }
 
-async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
-    let numpaths = fs::read_dir(format!("{NVMET_PATH}/ports")).unwrap().count();
-    info!("numpaths is {}", numpaths);
-
-    let mut last_port: &str = "0";
-    let latest_entry: PathBuf;
-    if numpaths > 0 {
-        let first: fs::DirEntry =
-            fs::read_dir(format!("{NVMET_PATH}/ports")).unwrap().nth(0).unwrap().unwrap();
-        latest_entry = first.path();
-        last_port = latest_entry.file_name().unwrap().to_str().unwrap();
+/// If `id` is already exported, return the port it is exported on.
+fn existing_export(id: &str) -> Option<String> {
+    let ports = fs::read_dir(format!("{NVMET_PATH}/ports")).ok()?;
+    for p in ports.flatten() {
+        if p.path().join("subsystems").join(id).exists() {
+            let svc = fs::read_to_string(p.path().join("addr_trsvcid")).ok()?;
+            return Some(svc.trim().to_string());
+        }
     }
-    info!("last_port is {}", last_port);
+    None
+}
 
-    let i = last_port.parse::<u32>().unwrap() + 1;
-    info!("i is {}", i);
+/// Highest numbered nvmet port directory (0 if none).
+fn last_port_number() -> u32 {
+    fs::read_dir(format!("{NVMET_PATH}/ports"))
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()))
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
+    let traddr = var("ABE_TRADDR").unwrap_or_else(|_| "0.0.0.0".to_string());
+
+    // Idempotent: re-attaching an exported volume just reports where it is.
+    if let Some(svc) = existing_export(&id) {
+        info!("{id} already exported on port {svc}");
+        return Ok(Json(Message {
+            message: format!("sudo nvme connect -a {traddr} -t tcp -s {svc} -n {id}"),
+            id,
+            port: svc,
+        }));
+    }
+
+    let i = last_port_number() + 1;
+    info!("allocating port {i}");
 
     let lv_path = lv_path_for_uuid(&id);
     
