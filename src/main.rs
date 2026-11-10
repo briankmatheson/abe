@@ -17,7 +17,8 @@ use ipnet::Ipv4Net;
 use env_logger::Env;
 use log::{info, warn};
 use axum::{
-    extract::Path as EP,
+    extract::{Path as EP, Query},
+    http::StatusCode,
     routing::{get, post},
     Json, Router
 };
@@ -27,7 +28,39 @@ use serde::{Deserialize, Serialize};
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
-const VOL_SIZE: &str = "100G";
+/// Default LV size when /configure is called without ?size=. Override with
+/// ABE_VOL_SIZE. Accepts anything lvcreate -L does (e.g. "10G", "512M").
+fn default_vol_size() -> String {
+    var("ABE_VOL_SIZE").unwrap_or_else(|_| "10G".to_string())
+}
+
+/// Convert a byte count (e.g. a CSI capacity) to an lvcreate -L size,
+/// rounded up to a whole MiB.
+fn bytes_to_lv_size(bytes: u64) -> String {
+    let mib = (bytes + (1 << 20) - 1) >> 20;
+    format!("{}M", mib.max(4))
+}
+
+#[derive(Deserialize, Default)]
+struct ConfigureParams {
+    /// lvcreate size string, e.g. "5G"
+    size: Option<String>,
+    /// or a raw byte count (takes precedence)
+    bytes: Option<u64>,
+}
+
+type ApiError = (StatusCode, Json<ErrorMessage>);
+
+#[derive(Serialize)]
+struct ErrorMessage {
+    error: String,
+}
+
+fn api_err<E: Display>(what: &str, e: E) -> ApiError {
+    let msg = format!("{what}: {e}");
+    warn!("{msg}");
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorMessage { error: msg }))
+}
 
 //env_inventory::register!(RUST_LOG = "info")
 
@@ -38,20 +71,27 @@ struct Message {
     port: String,
 }
 
-async fn configure() -> Json<Message> {
+async fn configure(Query(p): Query<ConfigureParams>) -> std::result::Result<Json<Message>, ApiError> {
+    let size = match (p.bytes, p.size) {
+        (Some(b), _) => bytes_to_lv_size(b),
+        (None, Some(s)) if !s.is_empty() => s,
+        _ => default_vol_size(),
+    };
     let id: String = Uuid::new_v4().to_string().replace("-", "");
-    create_lv(&id, VOL_SIZE);
-    info!("attach id is {}", id); 
+    create_lv(&id, &size).map_err(|e| api_err("create_lv", e))?;
+    info!("attach id is {}", id);
     do_attach(id).await
 }
 
-async fn attach(EP(id): EP<String>) -> Json<Message> {
-   
-    info!("attach id is {}", id);  
+async fn attach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiError> {
+    info!("attach id is {}", id);
+    if !Path::new(&lv_path_for_uuid(&id)).exists() {
+        return Err((StatusCode::NOT_FOUND, Json(ErrorMessage { error: format!("no volume {id}") })));
+    }
     do_attach(id).await
 }
-	
-async fn do_attach(id: String) -> Json<Message> {
+
+async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
     let numpaths = fs::read_dir(format!("{NVMET_PATH}/ports")).unwrap().count();
     info!("numpaths is {}", numpaths);
 
@@ -70,14 +110,14 @@ async fn do_attach(id: String) -> Json<Message> {
 
     let lv_path = lv_path_for_uuid(&id);
     
-    let target = Subsystem::create(&id).await.unwrap();
-    target.add_namespace("1", &lv_path).await.unwrap();
+    let target = Subsystem::create(&id).await.map_err(|e| api_err("nvmet subsystem", e))?;
+    target.add_namespace("1", &lv_path).await.map_err(|e| api_err("nvmet namespace", e))?;
 
     let svc_port = format!("44{:03}", i);
     info!("svc_port is {svc_port}");
 	
 
-    let port  = Port::create(id.clone(), &svc_port, "tcp", i).unwrap();
+    let port  = Port::create(id.clone(), &svc_port, "tcp", i).map_err(|e| api_err("nvmet port", e))?;
     port.link_subsystem(&target);
 	
     println!("{} {}:{}", port.id, port.traddr, port.trsvcid);
@@ -86,7 +126,7 @@ async fn do_attach(id: String) -> Json<Message> {
         Err(e) => info!("ufw not available ({}); skipping firewall rule", e),
     }
     
-    Json(Message {
+    Ok(Json(Message {
         message: format!("sudo nvme discover -a {} -t tcp -s {} ; sudo nvme connect -a {} -t tcp -s {} -n {}",
 			 port.traddr,
 			 port.trsvcid,
@@ -97,7 +137,7 @@ async fn do_attach(id: String) -> Json<Message> {
         id: id,
         port: port.trsvcid,
         
-    })
+    }))
 }
 
 // NVME over TCP target subsystem
@@ -126,11 +166,11 @@ impl Subsystem {
         fs::create_dir_all(&ns_path);
 
         info!("adding device {device_path}");
-        File::create(format!("{}/device_path", ns_path))?.write_all(device_path.as_bytes());
+        File::create(format!("{}/device_path", ns_path))?.write_all(device_path.as_bytes())?;
 
         
         info!("enabling {ns_path}/enable");
-        File::create(format!("{}/enable", ns_path))?.write_all(b"1");
+        File::create(format!("{}/enable", ns_path))?.write_all(b"1")?;
         Ok(())
     }
 }
@@ -230,34 +270,26 @@ pub fn create_lv(name: &str, size: &str) -> Result<()> {
         .args(["-y", "-W", "y", "-L", size, "-n", name, "abe"])
         .output()?;
 
-    if !output.status.success() {
-        info!("Boo!");
-        return Err(Error::new(
-            ErrorKind::Other,
-            format!(
-                "lvcreate failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        ));
-    }
-    info!("labeling lv {name}");
-    let output = Command::new("/usr/sbin/parted")
-        .args([&format!("/dev/abe/{name}"), "mklabel", "gpt"])
-        .output()?;
-    info!("create partition on lv {name}");
-    let output = Command::new("/usr/sbin/parted")
-        .args([&format!("/dev/abe/{name}"), "mkpart", "primary", "0%", "100%"])
-        .output()?;
-    info!("naming lv {name}");
-    let output = Command::new("/usr/sbin/parted")
-        .args([&format!("/dev/abe/{name}"), "name", "1", name])
-        .output()?;
-    info!("formatting partition on lv {name}");
-    let output = Command::new("/usr/sbin/mkfs.ext4")
-        .args([&format!("/dev/disk/by-partlabel/{name}")])
-        .output()?;
-    info!("Done!");
+    check(output, "lvcreate")?;
+    let dev = format!("/dev/abe/{name}");
+    // One GPT partition labelled with the volume id so initiators can find
+    // it by PARTLABEL. The partition is left blank: the client decides on
+    // encryption and filesystem.
+    info!("partitioning {dev}");
+    check(Command::new("/usr/sbin/parted").args(["-s", &dev, "mklabel", "gpt"]).output()?, "parted mklabel")?;
+    check(Command::new("/usr/sbin/parted").args(["-s", &dev, "mkpart", "primary", "1MiB", "100%"]).output()?, "parted mkpart")?;
+    check(Command::new("/usr/sbin/parted").args(["-s", &dev, "name", "1", name]).output()?, "parted name")?;
+    info!("created {dev} ({size})");
     Ok(())
+}
+
+fn check(output: std::process::Output, what: &str) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    warn!("{what} failed: {err}");
+    Err(Error::new(ErrorKind::Other, format!("{what} failed: {err}")))
 }    
 
 

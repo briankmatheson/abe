@@ -22,7 +22,7 @@ maintainer = "Brian Matheson <brian@brianmatheson.com>"
 copyright = "2024, Brian Matheson <brian@brianmatheson.com>"
 section = "admin"
 priority = "optional"
-depends = "lvm2"
+depends = "lvm2, parted"
 extended-description = """
 ABE (Abe Block Exporter) is an NVMe-oF block storage server.
 
