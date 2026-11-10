@@ -19,7 +19,7 @@ use log::{info, warn};
 use axum::{
     extract::{Path as EP, Query},
     http::StatusCode,
-    routing::{get, post},
+    routing::get,
     Json, Router
 };
 use serde::{Deserialize, Serialize};
@@ -89,6 +89,89 @@ async fn attach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiErr
         return Err((StatusCode::NOT_FOUND, Json(ErrorMessage { error: format!("no volume {id}") })));
     }
     do_attach(id).await
+}
+
+/// DELETE /id/<id>: stop exporting the volume and remove its LV.
+/// Idempotent: returns 404 only if neither an export nor an LV exists.
+async fn detach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiError> {
+    info!("delete id is {}", id);
+    let lv = lv_path_for_uuid(&id);
+    let exported = existing_export(&id).is_some();
+    if !exported && !Path::new(&lv).exists() {
+        return Err((StatusCode::NOT_FOUND, Json(ErrorMessage { error: format!("no volume {id}") })));
+    }
+    let port = remove_export(&id).map_err(|e| api_err("nvmet teardown", e))?;
+    if Path::new(&lv).exists() {
+        remove_holders(&lv).map_err(|e| api_err("remove partition mappings", e))?;
+        check(Command::new("/usr/sbin/lvremove").args(["-y", &lv]).output()
+                  .map_err(|e| api_err("lvremove", e))?, "lvremove")
+            .map_err(|e| api_err("lvremove", e))?;
+    }
+    if let Some(p) = &port {
+        match Command::new("/usr/sbin/ufw").args(["delete", "allow", p]).output() {
+            Ok(o) => info!("ufw delete allow {p}: {}", o.status),
+            Err(e) => info!("ufw not available ({e}); skipping firewall rule"),
+        }
+    }
+    Ok(Json(Message {
+        message: format!("deleted {id}"),
+        id,
+        port: port.unwrap_or_default(),
+    }))
+}
+
+/// udev creates a device-mapper partition map (abe-<id>p1) for the GPT
+/// partition on the LV; it holds the LV open and makes lvremove fail with
+/// "used by another device". Remove any such holders.
+fn remove_holders(lv: &str) -> Result<()> {
+    let dm = fs::canonicalize(lv)?;
+    let dm = dm.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+    let holders = match fs::read_dir(format!("/sys/block/{dm}/holders")) {
+        Ok(h) => h,
+        Err(_) => return Ok(()),
+    };
+    for h in holders.flatten() {
+        let name = fs::read_to_string(h.path().join("dm/name"))?.trim().to_string();
+        info!("removing holder {name}");
+        check(Command::new("/usr/sbin/dmsetup").args(["remove", "--retry", &name]).output()?, "dmsetup remove")?;
+    }
+    Ok(())
+}
+
+/// Tear down the nvmet port + subsystem for `id`. Returns the trsvcid the
+/// volume was exported on, if any. Missing pieces are not errors.
+fn remove_export(id: &str) -> Result<Option<String>> {
+    let mut svc = None;
+    if let Ok(ports) = fs::read_dir(format!("{NVMET_PATH}/ports")) {
+        for p in ports.flatten() {
+            let link = p.path().join("subsystems").join(id);
+            if !link.exists() {
+                continue;
+            }
+            svc = fs::read_to_string(p.path().join("addr_trsvcid")).ok().map(|s| s.trim().to_string());
+            info!("unlinking {}", link.display());
+            fs::remove_file(&link)?;
+            // Drop the port too if nothing else is exported through it.
+            let empty = fs::read_dir(p.path().join("subsystems")).map(|mut d| d.next().is_none()).unwrap_or(false);
+            if empty {
+                info!("removing port {}", p.path().display());
+                fs::remove_dir(p.path())?;
+            }
+        }
+    }
+    let subsys = PathBuf::from(format!("{NVMET_PATH}/subsystems/{id}"));
+    if subsys.exists() {
+        if let Ok(nss) = fs::read_dir(subsys.join("namespaces")) {
+            for ns in nss.flatten() {
+                let _ = write(ns.path().join("enable"), "0");
+                info!("removing namespace {}", ns.path().display());
+                fs::remove_dir(ns.path())?;
+            }
+        }
+        info!("removing subsystem {}", subsys.display());
+        fs::remove_dir(&subsys)?;
+    }
+    Ok(svc)
 }
 
 /// If `id` is already exported, return the port it is exported on.
@@ -324,7 +407,7 @@ async fn main() {
     ensure_nvmet_present();
 
     let app = Router::new()
-        .route("/id/:id", get(attach))
+        .route("/id/:id", get(attach).delete(detach))
         .route("/configure", get(configure));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:80").await.unwrap();
