@@ -68,6 +68,11 @@ fn default_vol_size() -> String {
     var("ABE_VOL_SIZE").unwrap_or_else(|_| "10G".to_string())
 }
 
+/// Size of the LV called `id`, if it exists.
+fn lv_bytes(id: &str) -> Option<u64> {
+    list_lvs().ok()?.into_iter().find(|l| l.name == id).map(|l| l.bytes)
+}
+
 /// Convert a byte count (e.g. a CSI capacity) to an lvcreate -L size,
 /// rounded up to a whole MiB.
 fn bytes_to_lv_size(bytes: u64) -> String {
@@ -110,6 +115,9 @@ struct Message {
     traddr: String,
     /// NVMe qualified name of the subsystem (== id)
     nqn: String,
+    /// size of the LV (what `?bytes=`/`?size=` produced, rounded up to a MiB)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
     /// what fio measured on a freshly created volume (/configure only)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     perf: Option<Perf>,
@@ -321,6 +329,7 @@ async fn detach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiErr
         id,
         port: port.unwrap_or_default(),
         traddr: advertised_traddr(),
+        bytes: None,
         perf: None,
     }))
 }
@@ -650,6 +659,7 @@ async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
         return Ok(Json(Message {
             message: format!("sudo nvme connect -a {traddr} -t tcp -s {svc} -n {id}"),
             nqn: id.clone(),
+            bytes: lv_bytes(&id),
             id,
             port: svc,
             traddr,
@@ -686,7 +696,8 @@ async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
 			 port.trsvcid,
 			 id),
         nqn: id.clone(),
-        id: id,
+        bytes: lv_bytes(&id),
+        id,
         port: port.trsvcid,
         traddr,
         perf: None,

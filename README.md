@@ -51,7 +51,7 @@ API
 
 | Request | Effect |
 |---|---|
-| `GET /configure?size=5G` or `?bytes=N` | create a volume (GPT + one partition labelled with its id) and export it |
+| `GET /configure?size=5G` or `?bytes=N` | create a volume of that size (default `ABE_VOL_SIZE`; GPT + one partition labelled with its id) and export it; the reply carries the resulting `bytes` |
 | `GET /configure?...&raw=true` | same, but leave the volume blank (VM disk images bring their own partition table) |
 | `GET /id/<id>` | (re-)export an existing volume; idempotent |
 | `DELETE /id/<id>` | unexport and remove the volume; idempotent |
