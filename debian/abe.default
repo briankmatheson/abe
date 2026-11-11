@@ -6,7 +6,9 @@
 # Thin pool inside ABE_VG. When set, volumes are thin LVs (lvcreate -V ... -T).
 #ABE_THIN_POOL=
 
-# Address nvmet listens on (default: 0.0.0.0, every interface).
+# Address nvmet listens on (default: 0.0.0.0, every interface). The API has
+# no authentication: on a multi-homed host bind this and ABE_LISTEN to one
+# private address (e.g. a WireGuard underlay) rather than 0.0.0.0.
 #ABE_TRADDR=0.0.0.0
 
 # Address handed to initiators in API replies. Set this when clients live on
