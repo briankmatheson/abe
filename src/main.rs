@@ -317,12 +317,6 @@ async fn detach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiErr
                   .map_err(|e| api_err("lvremove", e))?, "lvremove")
             .map_err(|e| api_err("lvremove", e))?;
     }
-    if let Some(p) = &port {
-        match Command::new("/usr/sbin/ufw").args(["delete", "allow", p]).output() {
-            Ok(o) => info!("ufw delete allow {p}: {}", o.status),
-            Err(e) => info!("ufw not available ({e}); skipping firewall rule"),
-        }
-    }
     Ok(Json(Message {
         message: format!("deleted {id}"),
         nqn: id.clone(),
@@ -683,10 +677,6 @@ async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
     port.link_subsystem(&target);
 	
     println!("{} {}:{}", port.id, port.traddr, port.trsvcid);
-    match Command::new("/usr/sbin/ufw").args(["allow", &port.trsvcid]).output() {
-        Ok(o) => info!("ufw allow {}: {}", port.trsvcid, o.status),
-        Err(e) => info!("ufw not available ({}); skipping firewall rule", e),
-    }
     
     Ok(Json(Message {
         message: format!("sudo nvme discover -a {} -t tcp -s {} ; sudo nvme connect -a {} -t tcp -s {} -n {}",

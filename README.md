@@ -46,6 +46,11 @@ Configuration is by environment (see `debian/abe.default`, installed as
 | `ABE_FIO_SECONDS` | `5` | seconds of fio writes on each new volume (0: off) |
 | `ABE_FIO_BS` | `4M` | fio block size |
 
+Volumes are exported on TCP ports 44001, 44002, … (one per export, on
+`ABE_TRADDR`). ABE does not touch the host firewall; open 80 and
+44000:44999 on the interface initiators use, e.g.
+`ufw allow in on wg-flock proto tcp from 10.22.0.0/16 to any port 44000:44999`.
+
 API
 ===
 
