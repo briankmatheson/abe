@@ -43,6 +43,8 @@ Configuration is by environment (see `debian/abe.default`, installed as
 | `ABE_TRADDR` | `0.0.0.0` | address nvmet listens on |
 | `ABE_ADVERTISE` | `ABE_TRADDR` | address reported to initiators (`traddr` in replies) |
 | `ABE_LISTEN` | `0.0.0.0:80` | HTTP API address |
+| `ABE_FIO_SECONDS` | `5` | seconds of fio writes on each new volume (0: off) |
+| `ABE_FIO_BS` | `4M` | fio block size |
 
 API
 ===
@@ -63,7 +65,12 @@ time. `layers` counts the origins beneath a volume; past
 does too, `/utilization` lists it under `warnings`, and abe logs it.
 
 Replies carry `id`, `port` (nvmet trsvcid), `traddr`, `nqn` (== id) and a
-ready-to-run `nvme connect` line in `message`. Each namespace is exported
+ready-to-run `nvme connect` line in `message`. `/configure` also runs
+fio on the new volume -- `ABE_FIO_SECONDS` (default 5, 0 disables) of
+sequential direct writes at `ABE_FIO_BS` (default 4M) -- and reports
+`perf`: `write_mib_s`, `write_iops`, `write_lat_ms` (mean completion
+latency), `bs`, `seconds`. The same numbers go to the log, so the pool's
+behaviour over time is in the journal. Each namespace is exported
 with `device_uuid` set to the volume id, so initiators get a stable
 `/dev/disk/by-id/nvme-uuid.<dashed id>` path.
 

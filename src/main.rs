@@ -110,6 +110,30 @@ struct Message {
     traddr: String,
     /// NVMe qualified name of the subsystem (== id)
     nqn: String,
+    /// what fio measured on a freshly created volume (/configure only)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    perf: Option<Perf>,
+}
+
+/// A short sequential-write run on a new volume, before it is handed out:
+/// how fast this pool takes 4M writes right now.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct Perf {
+    bs: String,
+    seconds: f64,
+    write_mib_s: f64,
+    write_iops: f64,
+    /// mean completion latency
+    write_lat_ms: f64,
+}
+
+/// How long fio writes to each new volume (ABE_FIO_SECONDS, default 5;
+/// 0 disables) and with what block size (ABE_FIO_BS, default 4M).
+fn fio_seconds() -> u64 {
+    var("ABE_FIO_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5)
+}
+fn fio_bs() -> String {
+    var("ABE_FIO_BS").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "4M".to_string())
 }
 
 /// One entry of GET /volumes.
@@ -207,7 +231,58 @@ async fn configure(Query(p): Query<ConfigureParams>) -> std::result::Result<Json
     let id: String = Uuid::new_v4().to_string().replace("-", "");
     create_lv(&id, &size, p.raw.unwrap_or(false)).map_err(|e| api_err("create_lv", e))?;
     info!("attach id is {}", id);
-    do_attach(id).await
+    let Json(mut m) = do_attach(id.clone()).await?;
+    // Measure after the export is set up so a fio problem cannot cost the
+    // caller its volume; the data written is garbage on a blank volume.
+    let dev = lv_path_for_uuid(&id);
+    m.perf = match tokio::task::spawn_blocking(move || characterize(&dev)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => { warn!("fio on {id}: {e}"); None }
+        Err(e) => { warn!("fio task on {id}: {e}"); None }
+    };
+    Ok(Json(m))
+}
+
+/// Sequential writes with fio for ABE_FIO_SECONDS at ABE_FIO_BS, direct
+/// I/O, straight at the LV. Ok(None) when disabled.
+fn characterize(dev: &str) -> Result<Option<Perf>> {
+    let secs = fio_seconds();
+    if secs == 0 {
+        return Ok(None);
+    }
+    let bs = fio_bs();
+    info!("fio: {secs}s of {bs} sequential writes on {dev}");
+    let out = Command::new("fio")
+        .args(["--name=abe", "--filename", dev, "--rw=write", "--bs", &bs,
+               "--direct=1", "--ioengine=libaio", "--iodepth=8",
+               "--time_based", "--runtime", &secs.to_string(),
+               "--output-format=json"])
+        .output()?;
+    check(out.clone(), "fio")?;
+    let perf = parse_fio(&String::from_utf8_lossy(&out.stdout), &bs)
+        .ok_or_else(|| Error::new(ErrorKind::Other, "fio printed no write results"))?;
+    info!("fio on {dev}: {:.0} MiB/s, {:.0} IOPS, {:.2} ms mean latency at bs={bs}",
+          perf.write_mib_s, perf.write_iops, perf.write_lat_ms);
+    Ok(Some(perf))
+}
+
+/// Pull the write numbers out of `fio --output-format=json`.
+fn parse_fio(json: &str, bs: &str) -> Option<Perf> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let job = v.get("jobs")?.as_array()?.first()?;
+    let w = job.get("write")?;
+    let runtime_ms = w.get("runtime")?.as_f64()?;
+    let bw_bytes = w.get("bw_bytes")?.as_f64()?;
+    let iops = w.get("iops")?.as_f64()?;
+    let lat_ns = w.get("clat_ns").and_then(|c| c.get("mean")).and_then(|m| m.as_f64()).unwrap_or(0.0);
+    let round = |x: f64| (x * 100.0).round() / 100.0;
+    Some(Perf {
+        bs: bs.to_string(),
+        seconds: round(runtime_ms / 1000.0),
+        write_mib_s: round(bw_bytes / (1024.0 * 1024.0)),
+        write_iops: round(iops),
+        write_lat_ms: round(lat_ns / 1e6),
+    })
 }
 
 async fn attach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiError> {
@@ -246,6 +321,7 @@ async fn detach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiErr
         id,
         port: port.unwrap_or_default(),
         traddr: advertised_traddr(),
+        perf: None,
     }))
 }
 
@@ -577,6 +653,7 @@ async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
             id,
             port: svc,
             traddr,
+            perf: None,
         }));
     }
 
@@ -612,6 +689,7 @@ async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
         id: id,
         port: port.trsvcid,
         traddr,
+        perf: None,
     }))
 }
 
@@ -968,6 +1046,26 @@ mod tests {
         assert!(summarize("timesink-vg", Some("abe-pool"), &lvs, 1, 1).is_err());
         // an LV of that name that is not a pool does not count
         assert!(summarize("timesink-vg", Some("root"), &lvs, 1, 1).is_err());
+    }
+
+    #[test]
+    fn parses_fio_json() {
+        let json = r#"{"fio version": "fio-3.33", "jobs": [{"jobname": "abe", "write": {
+            "io_bytes": 6442450944, "bw_bytes": 1287350000, "bw": 1257177, "iops": 306.94,
+            "runtime": 5004, "clat_ns": {"min": 1000, "max": 90000000, "mean": 26012345.6}}}]}"#;
+        let p = parse_fio(json, "4M").unwrap();
+        assert_eq!(p.bs, "4M");
+        assert_eq!(p.seconds, 5.0);
+        assert_eq!(p.write_mib_s, 1227.71);
+        assert_eq!(p.write_iops, 306.94);
+        assert_eq!(p.write_lat_ms, 26.01);
+    }
+
+    #[test]
+    fn fio_without_results_is_none() {
+        assert_eq!(parse_fio("", "4M"), None);
+        assert_eq!(parse_fio(r#"{"jobs": []}"#, "4M"), None);
+        assert_eq!(parse_fio(r#"{"jobs": [{"read": {"bw_bytes": 1}}]}"#, "4M"), None);
     }
 
     #[test]

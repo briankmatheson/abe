@@ -1,6 +1,6 @@
 [package]
 name = "abe"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 
 [dependencies]
@@ -22,7 +22,7 @@ maintainer = "Brian Matheson <brian@brianmatheson.com>"
 copyright = "2024, Brian Matheson <brian@brianmatheson.com>"
 section = "admin"
 priority = "optional"
-depends = "lvm2, parted"
+depends = "lvm2, parted, fio"
 extended-description = """
 ABE (Abe Block Exporter) is an NVMe-oF block storage server.
 

@@ -12,6 +12,8 @@ r=$(curl -sf "$URL/configure?bytes=$((64<<20))&raw=true") || fail "configure"
 id=$(echo "$r" | jq -r .id); port=$(echo "$r" | jq -r .port); traddr=$(echo "$r" | jq -r .traddr); nqn=$(echo "$r" | jq -r .nqn)
 [ "$nqn" = "$id" ] || fail "nqn != id"
 pass "configure id=$id port=$port traddr=$traddr"
+echo "$r" | jq -e '.perf.write_mib_s > 0 and .perf.bs == "4M" and .perf.seconds >= 4' >/dev/null || fail "perf missing from configure reply: $(echo "$r" | jq -c .perf)"
+pass "perf $(echo "$r" | jq -r '"\(.perf.write_mib_s) MiB/s, \(.perf.write_iops) IOPS, \(.perf.write_lat_ms) ms at \(.perf.bs)"')"
 
 curl -sf "$URL/volumes" | jq -e --arg id "$id" --arg p "$port" '.[] | select(.id==$id and .port==$p and .bytes==67108864)' >/dev/null || fail "/volumes lists it"
 pass "/volumes"
