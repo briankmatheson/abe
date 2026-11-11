@@ -28,6 +28,40 @@ use serde::{Deserialize, Serialize};
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
+
+/// Volume group the LVs live in. Override with ABE_VG.
+fn vg_name() -> String {
+    var("ABE_VG").unwrap_or_else(|_| "abe".to_string())
+}
+
+/// Thin pool inside the VG; when set, volumes are thin LVs
+/// (`lvcreate -V size -T vg/pool`) instead of thick ones. ABE_THIN_POOL.
+fn thin_pool() -> Option<String> {
+    var("ABE_THIN_POOL").ok().filter(|s| !s.is_empty())
+}
+
+/// Address nvmet listens on (ABE_TRADDR, default every interface).
+fn bind_traddr() -> String {
+    var("ABE_TRADDR").unwrap_or_else(|_| "0.0.0.0".to_string())
+}
+
+/// Address initiators should connect to (ABE_ADVERTISE). Defaults to the
+/// bind address, which is useless when that is 0.0.0.0, so set it when
+/// clients are on another box.
+fn advertised_traddr() -> String {
+    var("ABE_ADVERTISE").ok().filter(|s| !s.is_empty()).unwrap_or_else(bind_traddr)
+}
+
+/// HTTP listen address (ABE_LISTEN, default 0.0.0.0:80).
+fn listen_addr() -> String {
+    var("ABE_LISTEN").unwrap_or_else(|_| "0.0.0.0:80".to_string())
+}
+
+/// Volume ids are v4 UUIDs without dashes; nvmet wants the dashed form for
+/// device_uuid, which is what gives initiators /dev/disk/by-id/nvme-uuid.<id>.
+fn dashed_uuid(id: &str) -> Option<String> {
+    Uuid::parse_str(id).ok().map(|u| u.hyphenated().to_string())
+}
 /// Default LV size when /configure is called without ?size=. Override with
 /// ABE_VOL_SIZE. Accepts anything lvcreate -L does (e.g. "10G", "512M").
 fn default_vol_size() -> String {
@@ -47,6 +81,9 @@ struct ConfigureParams {
     size: Option<String>,
     /// or a raw byte count (takes precedence)
     bytes: Option<u64>,
+    /// leave the volume blank instead of writing a GPT with one partition
+    /// (VM disk images bring their own partition table)
+    raw: Option<bool>,
 }
 
 type ApiError = (StatusCode, Json<ErrorMessage>);
@@ -69,6 +106,21 @@ struct Message {
     message: String,
     id: String,
     port: String,
+    /// address initiators connect to (ABE_ADVERTISE)
+    traddr: String,
+    /// NVMe qualified name of the subsystem (== id)
+    nqn: String,
+}
+
+/// One entry of GET /volumes.
+#[derive(Serialize)]
+struct Volume {
+    id: String,
+    bytes: u64,
+    /// trsvcid if currently exported
+    port: Option<String>,
+    traddr: String,
+    nqn: String,
 }
 
 async fn configure(Query(p): Query<ConfigureParams>) -> std::result::Result<Json<Message>, ApiError> {
@@ -78,7 +130,7 @@ async fn configure(Query(p): Query<ConfigureParams>) -> std::result::Result<Json
         _ => default_vol_size(),
     };
     let id: String = Uuid::new_v4().to_string().replace("-", "");
-    create_lv(&id, &size).map_err(|e| api_err("create_lv", e))?;
+    create_lv(&id, &size, p.raw.unwrap_or(false)).map_err(|e| api_err("create_lv", e))?;
     info!("attach id is {}", id);
     do_attach(id).await
 }
@@ -115,9 +167,41 @@ async fn detach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiErr
     }
     Ok(Json(Message {
         message: format!("deleted {id}"),
+        nqn: id.clone(),
         id,
         port: port.unwrap_or_default(),
+        traddr: advertised_traddr(),
     }))
+}
+
+/// GET /volumes: every volume in the VG (exported or not).
+async fn volumes() -> std::result::Result<Json<Vec<Volume>>, ApiError> {
+    list_volumes().map(Json).map_err(|e| api_err("lvs", e))
+}
+
+fn list_volumes() -> Result<Vec<Volume>> {
+    let out = Command::new("/usr/sbin/lvs")
+        .args(["--noheadings", "--units", "b", "--nosuffix", "-o", "lv_name,lv_size", &vg_name()])
+        .output()?;
+    check(out.clone(), "lvs")?;
+    let traddr = advertised_traddr();
+    let mut vols = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut f = line.split_whitespace();
+        let (Some(name), Some(size)) = (f.next(), f.next()) else { continue };
+        // only our volumes: 32 hex chars
+        if name.len() != 32 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        vols.push(Volume {
+            id: name.to_string(),
+            bytes: size.parse().unwrap_or(0),
+            port: existing_export(name),
+            traddr: traddr.clone(),
+            nqn: name.to_string(),
+        });
+    }
+    Ok(vols)
 }
 
 /// udev creates a device-mapper partition map (abe-<id>p1) for the GPT
@@ -199,15 +283,17 @@ fn last_port_number() -> u32 {
 }
 
 async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
-    let traddr = var("ABE_TRADDR").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let traddr = advertised_traddr();
 
     // Idempotent: re-attaching an exported volume just reports where it is.
     if let Some(svc) = existing_export(&id) {
         info!("{id} already exported on port {svc}");
         return Ok(Json(Message {
             message: format!("sudo nvme connect -a {traddr} -t tcp -s {svc} -n {id}"),
+            nqn: id.clone(),
             id,
             port: svc,
+            traddr,
         }));
     }
 
@@ -234,15 +320,15 @@ async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
     
     Ok(Json(Message {
         message: format!("sudo nvme discover -a {} -t tcp -s {} ; sudo nvme connect -a {} -t tcp -s {} -n {}",
-			 port.traddr,
+			 traddr,
 			 port.trsvcid,
-			 port.traddr,
+			 traddr,
 			 port.trsvcid,
 			 id),
-        
+        nqn: id.clone(),
         id: id,
         port: port.trsvcid,
-        
+        traddr,
     }))
 }
 
@@ -274,6 +360,14 @@ impl Subsystem {
         info!("adding device {device_path}");
         File::create(format!("{}/device_path", ns_path))?.write_all(device_path.as_bytes())?;
 
+        // Stable identity for initiators: udev turns this into
+        // /dev/disk/by-id/nvme-uuid.<dashed id>, which survives reconnects
+        // and reboots (unlike /dev/nvmeXnY).
+        if let Some(u) = dashed_uuid(&self.name) {
+            info!("setting device_uuid {u}");
+            File::create(format!("{}/device_uuid", ns_path))?.write_all(u.as_bytes())?;
+        }
+
         
         info!("enabling {ns_path}/enable");
         File::create(format!("{}/enable", ns_path))?.write_all(b"1")?;
@@ -294,7 +388,7 @@ impl Port {
         info!("making port {path}");
         // nvmet-tcp accepts 0.0.0.0 to listen on every interface; override
         // with ABE_TRADDR to pin a specific one.
-        let traddr: String = std::env::var("ABE_TRADDR").unwrap_or_else(|_| "0.0.0.0".to_string());
+        let traddr: String = bind_traddr();
 	let mut trsvcid: String = svcid.to_string();
         let result = fs::create_dir_all(&path);
 	if result.is_ok() {
@@ -355,8 +449,7 @@ fn ensure_configfs_mounted() -> Result<()> {
 }
 
 fn lv_path_for_uuid(uuid: &str) ->  String {
-    let s: String = format!("/dev/abe/{uuid}");
-    s
+    format!("/dev/{}/{uuid}", vg_name())
 }
 
 fn ensure_nvmet_present() -> Result<()> {
@@ -370,14 +463,29 @@ fn ensure_nvmet_present() -> Result<()> {
     Ok(())
 }   
 
-pub fn create_lv(name: &str, size: &str) -> Result<()> {
-    info!("making lv {name}");
-    let output = Command::new("/usr/sbin/lvcreate")
-        .args(["-y", "-W", "y", "-L", size, "-n", name, "abe"])
-        .output()?;
+pub fn create_lv(name: &str, size: &str, raw: bool) -> Result<()> {
+    let vg = vg_name();
+    let output = match thin_pool() {
+        Some(pool) => {
+            info!("making thin lv {name} in {vg}/{pool}");
+            Command::new("/usr/sbin/lvcreate")
+                .args(["-y", "-W", "y", "-V", size, "-T", &format!("{vg}/{pool}"), "-n", name])
+                .output()?
+        }
+        None => {
+            info!("making lv {name} in {vg}");
+            Command::new("/usr/sbin/lvcreate")
+                .args(["-y", "-W", "y", "-L", size, "-n", name, &vg])
+                .output()?
+        }
+    };
 
     check(output, "lvcreate")?;
-    let dev = format!("/dev/abe/{name}");
+    let dev = lv_path_for_uuid(name);
+    if raw {
+        info!("created {dev} ({size}), left blank");
+        return Ok(());
+    }
     // One GPT partition labelled with the volume id so initiators can find
     // it by PARTLABEL. The partition is left blank: the client decides on
     // encryption and filesystem.
@@ -408,9 +516,11 @@ async fn main() {
 
     let app = Router::new()
         .route("/id/:id", get(attach).delete(detach))
-        .route("/configure", get(configure));
+        .route("/configure", get(configure))
+        .route("/volumes", get(volumes));
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:80").await.unwrap();
+    info!("vg={} thin_pool={:?} bind={} advertise={}", vg_name(), thin_pool(), bind_traddr(), advertised_traddr());
+    let listener = tokio::net::TcpListener::bind(listen_addr()).await.unwrap();
     if let Ok(addrs) = get_if_addrs() {
         for iface in addrs {
             if iface.ip().is_ipv4() && !iface.is_loopback() {

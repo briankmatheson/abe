@@ -1,6 +1,6 @@
 [package]
 name = "abe"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -32,5 +32,7 @@ assets = [
     ["target/release/abe", "usr/bin/", "755"],
     ["debian/abe.service", "usr/lib/systemd/system/", "644"],
     ["SECURITY_AUDIT.md", "usr/share/doc/abe/", "644"],
+    ["debian/abe.default", "etc/default/abe", "644"],
 ]
+conf-files = ["/etc/default/abe"]
 maintainer-scripts = "debian/"

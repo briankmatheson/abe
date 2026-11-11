@@ -1,0 +1,17 @@
+# /etc/default/abe -- environment for abe.service (all optional)
+
+# Volume group holding the volumes (default: abe).
+#ABE_VG=abe
+
+# Thin pool inside ABE_VG. When set, volumes are thin LVs (lvcreate -V ... -T).
+#ABE_THIN_POOL=
+
+# Address nvmet listens on (default: 0.0.0.0, every interface).
+#ABE_TRADDR=0.0.0.0
+
+# Address handed to initiators in API replies. Set this when clients live on
+# other machines; 0.0.0.0 is meaningless to them.
+#ABE_ADVERTISE=
+
+# HTTP API listen address (default: 0.0.0.0:80).
+#ABE_LISTEN=0.0.0.0:80
