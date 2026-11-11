@@ -53,7 +53,14 @@ API
 | `GET /configure?...&raw=true` | same, but leave the volume blank (VM disk images bring their own partition table) |
 | `GET /id/<id>` | (re-)export an existing volume; idempotent |
 | `DELETE /id/<id>` | unexport and remove the volume; idempotent |
-| `GET /volumes` | list every volume: `id`, `bytes`, `port` (if exported), `traddr`, `nqn` |
+| `GET /volumes` | list every volume: `id`, `bytes`, `port` (if exported), `traddr`, `nqn`, `used_bytes`, `data_percent`, `origin`, `layers`, `warning` |
+| `GET /clone/<id>` or `?bytes=N` | create a new volume as a thin snapshot of `<id>` (shares blocks until written; optionally grown to N bytes) and export it; needs `ABE_THIN_POOL` |
+| `GET /utilization` | thin pool (or VG) `bytes`, `used_bytes`, `free_bytes`, `data_percent`, `metadata_percent`, `provisioned_bytes`, `vg_bytes`, `vg_free_bytes`, `volumes`, `max_layers`, `warnings` |
+
+Clones are LVM thin snapshots, so a clone of a clone adds a layer every
+time. `layers` counts the origins beneath a volume; past
+`MAX_SNAPSHOT_LAYERS` (10) the volume carries a `warning`, the clone reply
+does too, `/utilization` lists it under `warnings`, and abe logs it.
 
 Replies carry `id`, `port` (nvmet trsvcid), `traddr`, `nqn` (== id) and a
 ready-to-run `nvme connect` line in `message`. Each namespace is exported

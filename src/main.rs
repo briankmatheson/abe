@@ -121,6 +121,81 @@ struct Volume {
     port: Option<String>,
     traddr: String,
     nqn: String,
+    /// bytes actually allocated: `bytes * data_percent` for a thin volume
+    /// (unknown while it is inactive), all of it for a thick one
+    used_bytes: Option<u64>,
+    /// thin volumes only: how much of `bytes` is allocated
+    data_percent: Option<f64>,
+    /// the volume this one was cloned from, while that volume still exists
+    origin: Option<String>,
+    /// snapshot layers under this volume: 0 for a plain volume, 1 for a
+    /// clone, 2 for a clone of a clone, ...
+    layers: u32,
+    /// set when `layers` is over MAX_SNAPSHOT_LAYERS
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+/// More snapshot layers than this under one volume earns a warning.
+const MAX_SNAPSHOT_LAYERS: u32 = 10;
+
+#[derive(Deserialize, Default)]
+struct CloneParams {
+    /// size of the clone; defaults to the origin's, and cannot be smaller
+    bytes: Option<u64>,
+}
+
+/// Reply of GET /clone/<id>: the usual export reply plus where the clone
+/// came from.
+#[derive(Serialize)]
+struct CloneReply {
+    #[serde(flatten)]
+    export: Message,
+    bytes: u64,
+    origin: String,
+    layers: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+/// Reply of GET /utilization.
+#[derive(Serialize, Debug, PartialEq)]
+struct Utilization {
+    vg: String,
+    thin_pool: Option<String>,
+    /// space volumes are carved from: the thin pool, or the whole VG
+    bytes: u64,
+    used_bytes: u64,
+    free_bytes: u64,
+    data_percent: f64,
+    /// thin pool only; the pool stops working when its metadata fills up
+    metadata_percent: Option<f64>,
+    metadata_bytes: Option<u64>,
+    /// thin pool: sum of the sizes promised to its volumes (may exceed
+    /// `bytes`); otherwise the same as `used_bytes`
+    provisioned_bytes: u64,
+    vg_bytes: u64,
+    /// unallocated VG space (what a thin pool could still be grown by)
+    vg_free_bytes: u64,
+    /// number of abe volumes
+    volumes: usize,
+    /// deepest snapshot chain in the VG
+    max_layers: u32,
+    /// one line per LV with more than MAX_SNAPSHOT_LAYERS snapshot layers
+    warnings: Vec<String>,
+}
+
+/// One row of `lvs`.
+#[derive(Debug, Clone, PartialEq)]
+struct Lv {
+    name: String,
+    bytes: u64,
+    pool: Option<String>,
+    origin: Option<String>,
+    data_percent: Option<f64>,
+    metadata_percent: Option<f64>,
+    metadata_bytes: Option<u64>,
+    segtype: String,
 }
 
 async fn configure(Query(p): Query<ConfigureParams>) -> std::result::Result<Json<Message>, ApiError> {
@@ -179,26 +254,234 @@ async fn volumes() -> std::result::Result<Json<Vec<Volume>>, ApiError> {
     list_volumes().map(Json).map_err(|e| api_err("lvs", e))
 }
 
-fn list_volumes() -> Result<Vec<Volume>> {
+/// GET /utilization: how full the thin pool (or VG) is.
+async fn utilization() -> std::result::Result<Json<Utilization>, ApiError> {
+    let lvs = list_lvs().map_err(|e| api_err("lvs", e))?;
+    let (vg_bytes, vg_free) = vg_space().map_err(|e| api_err("vgs", e))?;
+    summarize(&vg_name(), thin_pool().as_deref(), &lvs, vg_bytes, vg_free)
+        .map(Json)
+        .map_err(|e| api_err("utilization", e))
+}
+
+/// GET /clone/<id>[?bytes=N]: create a new volume that starts out as a copy
+/// of <id> (a thin snapshot: it shares the origin's blocks until either side
+/// writes) and export it. The origin may be any thin volume in abe's pool.
+async fn clone_volume(EP(origin): EP<String>, Query(p): Query<CloneParams>)
+                      -> std::result::Result<Json<CloneReply>, ApiError> {
+    info!("clone of {origin}");
+    let bad = |code, error: String| (code, Json(ErrorMessage { error }));
+    let lvs = list_lvs().map_err(|e| api_err("lvs", e))?;
+    let Some(src) = lvs.iter().find(|l| l.name == origin) else {
+        return Err(bad(StatusCode::NOT_FOUND, format!("no volume {origin}")));
+    };
+    if src.segtype != "thin" || src.pool.is_none() || src.pool != thin_pool() {
+        return Err(bad(StatusCode::BAD_REQUEST, format!(
+            "{origin} is not a thin volume in abe's pool ({}/{}); only those can be cloned",
+            vg_name(), thin_pool().unwrap_or_else(|| "<ABE_THIN_POOL not set>".to_string()))));
+    }
+    if let Some(b) = p.bytes {
+        if b < src.bytes {
+            return Err(bad(StatusCode::BAD_REQUEST, format!(
+                "a clone cannot be smaller than its origin ({b} < {} bytes)", src.bytes)));
+        }
+    }
+    let grow_to = p.bytes.filter(|b| *b > src.bytes);
+
+    let id: String = Uuid::new_v4().to_string().replace("-", "");
+    let layers = layers(&lvs, &origin) + 1;
+    let warning = layer_warning(&id, layers);
+    if let Some(w) = &warning {
+        warn!("{w}");
+    }
+    clone_lv(&origin, &id, grow_to).map_err(|e| api_err("clone_lv", e))?;
+    let bytes = list_lvs().ok()
+        .and_then(|l| l.into_iter().find(|l| l.name == id).map(|l| l.bytes))
+        .unwrap_or(grow_to.unwrap_or(src.bytes));
+    let Json(export) = do_attach(id).await?;
+    Ok(Json(CloneReply { export, bytes, origin, layers, warning }))
+}
+
+/// Thin snapshot of `origin` named `name`, activated, optionally grown to
+/// `grow_to` bytes. Nothing is left behind if a step fails.
+fn clone_lv(origin: &str, name: &str, grow_to: Option<u64>) -> Result<()> {
+    let vg = vg_name();
+    let lv = format!("{vg}/{name}");
+    info!("making thin snapshot {lv} of {vg}/{origin}");
+    check(Command::new("/usr/sbin/lvcreate")
+              .args(["-y", "-s", "-n", name, &format!("{vg}/{origin}")]).output()?, "lvcreate -s")?;
+    // Thin snapshots are created with the activation-skip flag set; clear it
+    // so the volume comes up now and after every reboot.
+    let finish = || -> Result<()> {
+        check(Command::new("/usr/sbin/lvchange").args(["-y", "-kn", &lv]).output()?, "lvchange -kn")?;
+        check(Command::new("/usr/sbin/lvchange").args(["-y", "-ay", &lv]).output()?, "lvchange -ay")?;
+        if let Some(b) = grow_to {
+            check(Command::new("/usr/sbin/lvextend")
+                      .args(["-y", "-L", &bytes_to_lv_size(b), &lv]).output()?, "lvextend")?;
+        }
+        Ok(())
+    };
+    if let Err(e) = finish() {
+        match Command::new("/usr/sbin/lvremove").args(["-y", &lv]).output() {
+            Ok(o) if o.status.success() => info!("removed half-made clone {lv}"),
+            _ => warn!("could not remove half-made clone {lv}"),
+        }
+        return Err(e);
+    }
+    info!("created {} as a clone of {origin}", lv_path_for_uuid(name));
+    Ok(())
+}
+
+/// abe's own volumes are named by their id: 32 hex chars.
+fn is_volume_id(name: &str) -> bool {
+    name.len() == 32 && name.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+const LVS_FIELDS: &str = "lv_name,lv_size,pool_lv,origin,data_percent,metadata_percent,lv_metadata_size,segtype";
+
+/// Every LV in the VG.
+fn list_lvs() -> Result<Vec<Lv>> {
     let out = Command::new("/usr/sbin/lvs")
-        .args(["--noheadings", "--units", "b", "--nosuffix", "-o", "lv_name,lv_size", &vg_name()])
+        .env("LC_ALL", "C")
+        .args(["--noheadings", "--units", "b", "--nosuffix", "--separator", "|", "-o", LVS_FIELDS, &vg_name()])
         .output()?;
     check(out.clone(), "lvs")?;
-    let traddr = advertised_traddr();
-    let mut vols = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let mut f = line.split_whitespace();
-        let (Some(name), Some(size)) = (f.next(), f.next()) else { continue };
-        // only our volumes: 32 hex chars
-        if name.len() != 32 || !name.chars().all(|c| c.is_ascii_hexdigit()) {
+    Ok(parse_lvs(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Parse `lvs --noheadings --units b --nosuffix --separator '|' -o LVS_FIELDS`.
+fn parse_lvs(text: &str) -> Vec<Lv> {
+    let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    let mut lvs = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('|').map(str::trim).collect();
+        if f.len() < 8 || f[0].is_empty() {
             continue;
         }
+        let Ok(bytes) = f[1].parse() else { continue };
+        lvs.push(Lv {
+            name: f[0].to_string(),
+            bytes,
+            pool: some(f[2]),
+            // lvs brackets the names of hidden LVs
+            origin: some(f[3].trim_start_matches('[').trim_end_matches(']')),
+            data_percent: f[4].parse().ok(),
+            metadata_percent: f[5].parse().ok(),
+            metadata_bytes: f[6].parse().ok(),
+            segtype: f[7].to_string(),
+        });
+    }
+    lvs
+}
+
+/// (size, free) of the VG in bytes.
+fn vg_space() -> Result<(u64, u64)> {
+    let out = Command::new("/usr/sbin/vgs")
+        .env("LC_ALL", "C")
+        .args(["--noheadings", "--units", "b", "--nosuffix", "--separator", "|", "-o", "vg_size,vg_free", &vg_name()])
+        .output()?;
+    check(out.clone(), "vgs")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_vgs(&text).ok_or_else(|| Error::new(ErrorKind::Other, format!("cannot parse vgs output {:?}", text.trim())))
+}
+
+fn parse_vgs(text: &str) -> Option<(u64, u64)> {
+    let mut f = text.lines().find(|l| !l.trim().is_empty())?.split('|').map(str::trim);
+    Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+}
+
+/// Snapshot layers under `name`: how many origins lvs reports beneath it.
+/// LVM drops the link when an origin is removed, so this counts the layers
+/// that still exist as volumes.
+fn layers(lvs: &[Lv], name: &str) -> u32 {
+    let mut depth = 0;
+    let mut cur = name;
+    // the bound only matters if the report were ever to contain a loop
+    while (depth as usize) < lvs.len() {
+        match lvs.iter().find(|l| l.name == cur).and_then(|l| l.origin.as_deref()) {
+            Some(o) => { depth += 1; cur = o; }
+            None => break,
+        }
+    }
+    depth
+}
+
+fn layer_warning(name: &str, layers: u32) -> Option<String> {
+    (layers > MAX_SNAPSHOT_LAYERS).then(|| format!(
+        "{name} has {layers} snapshot layers (more than {MAX_SNAPSHOT_LAYERS})"))
+}
+
+/// `pct` percent of `bytes`. lvs reports percentages to two decimals, so
+/// this is only that precise.
+fn percent_of(bytes: u64, pct: f64) -> u64 {
+    ((bytes as f64) * pct / 100.0).round() as u64
+}
+
+fn summarize(vg: &str, pool: Option<&str>, lvs: &[Lv], vg_bytes: u64, vg_free: u64) -> Result<Utilization> {
+    let mut max_layers = 0;
+    let mut warnings = Vec::new();
+    for l in lvs {
+        let n = layers(lvs, &l.name);
+        max_layers = max_layers.max(n);
+        warnings.extend(layer_warning(&l.name, n));
+    }
+    let volumes = lvs.iter().filter(|l| is_volume_id(&l.name)).count();
+    let mut u = Utilization {
+        vg: vg.to_string(),
+        thin_pool: pool.map(str::to_string),
+        bytes: vg_bytes,
+        used_bytes: vg_bytes.saturating_sub(vg_free),
+        free_bytes: vg_free,
+        data_percent: 0.0,
+        metadata_percent: None,
+        metadata_bytes: None,
+        provisioned_bytes: vg_bytes.saturating_sub(vg_free),
+        vg_bytes,
+        vg_free_bytes: vg_free,
+        volumes,
+        max_layers,
+        warnings,
+    };
+    if let Some(pool) = pool {
+        let p = lvs.iter().find(|l| l.name == pool && l.segtype == "thin-pool")
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no thin pool {vg}/{pool}")))?;
+        let pct = p.data_percent
+            .ok_or_else(|| Error::new(ErrorKind::Other, format!("thin pool {vg}/{pool} reports no usage (inactive?)")))?;
+        u.bytes = p.bytes;
+        u.used_bytes = percent_of(p.bytes, pct).min(p.bytes);
+        u.free_bytes = p.bytes - u.used_bytes;
+        u.data_percent = pct;
+        u.metadata_percent = p.metadata_percent;
+        u.metadata_bytes = p.metadata_bytes;
+        u.provisioned_bytes = lvs.iter()
+            .filter(|l| l.segtype == "thin" && l.pool.as_deref() == Some(pool))
+            .map(|l| l.bytes).sum();
+    } else if u.bytes > 0 {
+        u.data_percent = ((u.used_bytes as f64) * 10000.0 / (u.bytes as f64)).round() / 100.0;
+    }
+    Ok(u)
+}
+
+fn list_volumes() -> Result<Vec<Volume>> {
+    let lvs = list_lvs()?;
+    let traddr = advertised_traddr();
+    let mut vols = Vec::new();
+    for l in lvs.iter().filter(|l| is_volume_id(&l.name)) {
+        let n = layers(&lvs, &l.name);
         vols.push(Volume {
-            id: name.to_string(),
-            bytes: size.parse().unwrap_or(0),
-            port: existing_export(name),
+            id: l.name.clone(),
+            bytes: l.bytes,
+            port: existing_export(&l.name),
             traddr: traddr.clone(),
-            nqn: name.to_string(),
+            nqn: l.name.clone(),
+            used_bytes: if l.segtype == "thin" {
+                l.data_percent.map(|p| percent_of(l.bytes, p).min(l.bytes))
+            } else {
+                Some(l.bytes)
+            },
+            data_percent: l.data_percent,
+            origin: l.origin.clone(),
+            layers: n,
+            warning: layer_warning(&l.name, n),
         });
     }
     Ok(vols)
@@ -517,7 +800,9 @@ async fn main() {
     let app = Router::new()
         .route("/id/:id", get(attach).delete(detach))
         .route("/configure", get(configure))
-        .route("/volumes", get(volumes));
+        .route("/clone/:id", get(clone_volume))
+        .route("/volumes", get(volumes))
+        .route("/utilization", get(utilization));
 
     info!("vg={} thin_pool={:?} bind={} advertise={}", vg_name(), thin_pool(), bind_traddr(), advertised_traddr());
     let listener = tokio::net::TcpListener::bind(listen_addr()).await.unwrap();
@@ -529,4 +814,167 @@ async fn main() {
 	}
     }
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // What `lvs --noheadings --units b --nosuffix --separator '|' -o LVS_FIELDS`
+    // prints: a thick LV, a thin pool, a base image, two abe volumes (the
+    // second a clone of the first) and an inactive snapshot.
+    const LVS: &str = "\
+  root|99996401664||||||linear
+  abe|1398887514112|||12.34|10.50|2147483648|thin-pool
+  base-xdebbie-base|10737418240|abe||25.00|||thin
+  0123456789abcdef0123456789abcdef|42949672960|abe|base-xdebbie-base|50.00|||thin
+  fedcba9876543210fedcba9876543210|42949672960|abe|0123456789abcdef0123456789abcdef|0.00|||thin
+  parked|10737418240|abe|[gone]||||thin
+";
+
+    fn thin(name: &str, origin: Option<&str>) -> Lv {
+        Lv {
+            name: name.to_string(),
+            bytes: 1 << 30,
+            pool: Some("abe".to_string()),
+            origin: origin.map(str::to_string),
+            data_percent: Some(0.0),
+            metadata_percent: None,
+            metadata_bytes: None,
+            segtype: "thin".to_string(),
+        }
+    }
+
+    /// v0, v1 cloned from v0, ... v<n> cloned from v<n-1>.
+    fn chain(n: usize) -> Vec<Lv> {
+        let mut lvs = vec![thin("v0", None)];
+        for i in 1..=n {
+            lvs.push(thin(&format!("v{i}"), Some(&format!("v{}", i - 1))));
+        }
+        lvs
+    }
+
+    #[test]
+    fn parses_lvs() {
+        let lvs = parse_lvs(LVS);
+        assert_eq!(lvs.len(), 6);
+        assert_eq!(lvs[0], Lv {
+            name: "root".into(), bytes: 99996401664, pool: None, origin: None, data_percent: None,
+            metadata_percent: None, metadata_bytes: None, segtype: "linear".into(),
+        });
+        assert_eq!(lvs[1].segtype, "thin-pool");
+        assert_eq!(lvs[1].data_percent, Some(12.34));
+        assert_eq!(lvs[1].metadata_percent, Some(10.5));
+        assert_eq!(lvs[1].metadata_bytes, Some(2147483648));
+        assert_eq!(lvs[3].pool.as_deref(), Some("abe"));
+        assert_eq!(lvs[3].origin.as_deref(), Some("base-xdebbie-base"));
+        assert_eq!(lvs[5].origin.as_deref(), Some("gone"));
+        assert_eq!(lvs[5].data_percent, None);
+    }
+
+    #[test]
+    fn skips_garbage_lines() {
+        assert!(parse_lvs("").is_empty());
+        assert!(parse_lvs("  WARNING: something\n\n  a|b\n  x|notanumber||||||thin\n").is_empty());
+    }
+
+    #[test]
+    fn parses_vgs() {
+        assert_eq!(parse_vgs("  1999307276288|599785537536\n"), Some((1999307276288, 599785537536)));
+        assert_eq!(parse_vgs(""), None);
+        assert_eq!(parse_vgs("  1.82t|558g\n"), None);
+    }
+
+    #[test]
+    fn counts_layers() {
+        let lvs = parse_lvs(LVS);
+        assert_eq!(layers(&lvs, "root"), 0);
+        assert_eq!(layers(&lvs, "base-xdebbie-base"), 0);
+        assert_eq!(layers(&lvs, "0123456789abcdef0123456789abcdef"), 1);
+        assert_eq!(layers(&lvs, "fedcba9876543210fedcba9876543210"), 2);
+        // the origin is named but no longer in the report: still one layer
+        assert_eq!(layers(&lvs, "parked"), 1);
+        assert_eq!(layers(&lvs, "nonexistent"), 0);
+    }
+
+    #[test]
+    fn layer_count_survives_a_loop() {
+        let lvs = vec![thin("a", Some("b")), thin("b", Some("a"))];
+        assert_eq!(layers(&lvs, "a"), 2);
+    }
+
+    #[test]
+    fn warns_only_past_ten_layers() {
+        let lvs = chain(11);
+        assert_eq!(layers(&lvs, "v10"), 10);
+        assert_eq!(layer_warning("v10", layers(&lvs, "v10")), None);
+        assert_eq!(layers(&lvs, "v11"), 11);
+        assert_eq!(layer_warning("v11", layers(&lvs, "v11")).as_deref(),
+                   Some("v11 has 11 snapshot layers (more than 10)"));
+    }
+
+    #[test]
+    fn a_clone_of_the_tenth_layer_is_the_first_to_warn() {
+        // what clone_volume computes before it creates anything
+        let lvs = chain(10);
+        assert_eq!(layer_warning("new", layers(&lvs, "v9") + 1), None);
+        assert!(layer_warning("new", layers(&lvs, "v10") + 1).is_some());
+    }
+
+    #[test]
+    fn summarizes_a_thin_pool() {
+        let lvs = parse_lvs(LVS);
+        let u = summarize("timesink-vg", Some("abe"), &lvs, 1999307276288, 599785537536).unwrap();
+        assert_eq!(u.bytes, 1398887514112);
+        assert_eq!(u.used_bytes, 172622719241); // 12.34 %
+        assert_eq!(u.free_bytes, 1398887514112 - 172622719241);
+        assert_eq!(u.data_percent, 12.34);
+        assert_eq!(u.metadata_percent, Some(10.5));
+        assert_eq!(u.metadata_bytes, Some(2147483648));
+        // base + two volumes + parked; not root, not the pool itself
+        assert_eq!(u.provisioned_bytes, 10737418240 + 2 * 42949672960 + 10737418240);
+        assert_eq!(u.vg_bytes, 1999307276288);
+        assert_eq!(u.vg_free_bytes, 599785537536);
+        assert_eq!(u.volumes, 2);
+        assert_eq!(u.max_layers, 2);
+        assert!(u.warnings.is_empty());
+    }
+
+    #[test]
+    fn summarizes_a_plain_vg() {
+        let lvs = parse_lvs("  0123456789abcdef0123456789abcdef|1073741824||||||linear\n");
+        let u = summarize("abe", None, &lvs, 4 << 30, 3 << 30).unwrap();
+        assert_eq!((u.bytes, u.used_bytes, u.free_bytes), (4 << 30, 1 << 30, 3 << 30));
+        assert_eq!(u.data_percent, 25.0);
+        assert_eq!(u.metadata_percent, None);
+        assert_eq!(u.volumes, 1);
+    }
+
+    #[test]
+    fn summary_lists_deep_chains() {
+        let mut lvs = chain(12);
+        lvs.push(Lv { name: "abe".into(), segtype: "thin-pool".into(), pool: None, ..thin("abe", None) });
+        let u = summarize("abe", Some("abe"), &lvs, 1 << 40, 0).unwrap();
+        assert_eq!(u.max_layers, 12);
+        assert_eq!(u.warnings, vec![
+            "v11 has 11 snapshot layers (more than 10)".to_string(),
+            "v12 has 12 snapshot layers (more than 10)".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn summary_fails_without_its_pool() {
+        let lvs = parse_lvs(LVS);
+        assert!(summarize("timesink-vg", Some("abe-pool"), &lvs, 1, 1).is_err());
+        // an LV of that name that is not a pool does not count
+        assert!(summarize("timesink-vg", Some("root"), &lvs, 1, 1).is_err());
+    }
+
+    #[test]
+    fn recognises_volume_ids() {
+        assert!(is_volume_id("0123456789abcdef0123456789abcdef"));
+        assert!(!is_volume_id("base-xdebbie-base"));
+        assert!(!is_volume_id("0123456789abcdef0123456789abcde"));
+        assert!(!is_volume_id("0123456789abcdef0123456789abcdeg"));
+    }
 }
