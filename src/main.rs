@@ -123,29 +123,32 @@ struct Message {
     perf: Option<Perf>,
 }
 
-/// Two short fio runs on a new volume, before it is handed out: how fast
-/// this pool takes 4M sequential writes right now (bandwidth), and the
-/// mean completion latency of a single outstanding 4k random write
-/// (what one synchronous IO costs on this pool).
+/// A short fio run on a new volume before it is handed out: random
+/// direct writes at ABE_FIO_BS (4k) with ABE_FIO_IODEPTH (1) in flight,
+/// so write_lat_us is what one synchronous small write costs on this pool
+/// right now.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct Perf {
     bs: String,
+    iodepth: u32,
     seconds: f64,
     write_mib_s: f64,
     write_iops: f64,
-    /// mean completion latency of the sequential run (bs, iodepth 8)
-    write_lat_ms: f64,
-    /// mean completion latency, 4k random write, iodepth 1
-    lat_4k_us: f64,
+    /// mean completion latency
+    write_lat_us: f64,
 }
 
 /// How long fio writes to each new volume (ABE_FIO_SECONDS, default 5;
-/// 0 disables) and with what block size (ABE_FIO_BS, default 4M).
+/// 0 disables), with what block size (ABE_FIO_BS, default 4k) and how
+/// many in flight (ABE_FIO_IODEPTH, default 1).
 fn fio_seconds() -> u64 {
     var("ABE_FIO_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5)
 }
 fn fio_bs() -> String {
-    var("ABE_FIO_BS").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "4M".to_string())
+    var("ABE_FIO_BS").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "4k".to_string())
+}
+fn fio_iodepth() -> u32 {
+    var("ABE_FIO_IODEPTH").ok().and_then(|s| s.parse().ok()).filter(|&d| d > 0).unwrap_or(1)
 }
 
 /// One entry of GET /volumes.
@@ -256,67 +259,50 @@ async fn configure(Query(p): Query<ConfigureParams>) -> std::result::Result<Json
     Ok(Json(m))
 }
 
-/// Direct-I/O fio straight at the LV, ABE_FIO_SECONDS each: sequential
-/// writes at ABE_FIO_BS with 8 in flight, then 4k random writes one at a
-/// time over the first GiB (which the sequential pass has just allocated,
-/// so thin-pool chunk allocation does not land in the latency figure).
-/// Ok(None) when disabled.
+/// Direct-I/O fio straight at the LV for ABE_FIO_SECONDS: random writes
+/// at ABE_FIO_BS, ABE_FIO_IODEPTH in flight, over the first GiB. A fresh
+/// thin volume allocates chunks as they are first written, so this is
+/// what a new volume really costs, allocation included. Ok(None) when
+/// disabled.
 fn characterize(dev: &str, bytes: u64) -> Result<Option<Perf>> {
     let secs = fio_seconds();
     if secs == 0 {
         return Ok(None);
     }
-    let bs = fio_bs();
-    let secs = secs.to_string();
-    info!("fio: {secs}s of {bs} sequential writes on {dev}");
-    let seq = fio(&["--name=abe-seq", "--filename", dev, "--rw=write", "--bs", &bs,
-                    "--iodepth=8", "--runtime", &secs])?;
-    let region = bytes.min(1 << 30).to_string();
-    info!("fio: {secs}s of 4k random writes, iodepth 1, on the first {region} bytes of {dev}");
-    let rand = fio(&["--name=abe-4k", "--filename", dev, "--rw=randwrite", "--bs=4k",
-                     "--iodepth=1", "--size", &region, "--runtime", &secs])?;
-    let perf = parse_fio(&seq, &rand, &bs)
+    let (bs, iodepth) = (fio_bs(), fio_iodepth());
+    let region = bytes.min(1 << 30);
+    info!("fio: {secs}s of {bs} random writes, iodepth {iodepth}, on the first {region} bytes of {dev}");
+    let out = Command::new("fio")
+        .args(["--name=abe", "--filename", dev, "--rw=randwrite", "--bs", &bs,
+               "--iodepth", &iodepth.to_string(), "--size", &region.to_string(),
+               "--direct=1", "--ioengine=libaio",
+               "--time_based", "--runtime", &secs.to_string(),
+               "--output-format=json"])
+        .output()?;
+    check(out.clone(), "fio")?;
+    let perf = parse_fio(&String::from_utf8_lossy(&out.stdout), &bs, iodepth)
         .ok_or_else(|| Error::new(ErrorKind::Other, "fio printed no write results"))?;
-    info!("fio on {dev}: {:.0} MiB/s, {:.0} IOPS, {:.2} ms mean latency at bs={bs}; 4k qd1 {:.0} us",
-          perf.write_mib_s, perf.write_iops, perf.write_lat_ms, perf.lat_4k_us);
+    info!("fio on {dev}: {:.0} us mean latency, {:.0} IOPS, {:.1} MiB/s at bs={bs} iodepth={iodepth}",
+          perf.write_lat_us, perf.write_iops, perf.write_mib_s);
     Ok(Some(perf))
 }
 
-/// One fio job with the common flags, JSON on stdout.
-fn fio(args: &[&str]) -> Result<String> {
-    let out = Command::new("fio")
-        .args(["--direct=1", "--ioengine=libaio", "--time_based", "--output-format=json"])
-        .args(args)
-        .output()?;
-    check(out.clone(), "fio")?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// The write section of the first job in `fio --output-format=json`.
-fn fio_write(json: &str) -> Option<serde_json::Value> {
+/// Pull the write numbers out of `fio --output-format=json`.
+fn parse_fio(json: &str, bs: &str, iodepth: u32) -> Option<Perf> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    v.get("jobs")?.as_array()?.first()?.get("write").cloned()
-}
-
-fn fio_clat_mean_ns(w: &serde_json::Value) -> f64 {
-    w.get("clat_ns").and_then(|c| c.get("mean")).and_then(|m| m.as_f64()).unwrap_or(0.0)
-}
-
-/// Pull the numbers out of the two fio runs.
-fn parse_fio(seq_json: &str, rand_json: &str, bs: &str) -> Option<Perf> {
-    let w = fio_write(seq_json)?;
+    let w = v.get("jobs")?.as_array()?.first()?.get("write")?;
     let runtime_ms = w.get("runtime")?.as_f64()?;
     let bw_bytes = w.get("bw_bytes")?.as_f64()?;
     let iops = w.get("iops")?.as_f64()?;
-    let r = fio_write(rand_json)?;
+    let lat_ns = w.get("clat_ns").and_then(|c| c.get("mean")).and_then(|m| m.as_f64()).unwrap_or(0.0);
     let round = |x: f64| (x * 100.0).round() / 100.0;
     Some(Perf {
         bs: bs.to_string(),
+        iodepth,
         seconds: round(runtime_ms / 1000.0),
         write_mib_s: round(bw_bytes / (1024.0 * 1024.0)),
         write_iops: round(iops),
-        write_lat_ms: round(fio_clat_mean_ns(&w) / 1e6),
-        lat_4k_us: round(fio_clat_mean_ns(&r) / 1e3),
+        write_lat_us: round(lat_ns / 1e3),
     })
 }
 
@@ -1076,30 +1062,25 @@ mod tests {
         assert!(summarize("timesink-vg", Some("root"), &lvs, 1, 1).is_err());
     }
 
-    const SEQ: &str = r#"{"fio version": "fio-3.33", "jobs": [{"jobname": "abe-seq", "write": {
-        "io_bytes": 6442450944, "bw_bytes": 1287350000, "bw": 1257177, "iops": 306.94,
-        "runtime": 5004, "clat_ns": {"min": 1000, "max": 90000000, "mean": 26012345.6}}}]}"#;
-    const RAND: &str = r#"{"jobs": [{"jobname": "abe-4k", "write": {
-        "bw_bytes": 20480000, "iops": 5000.0, "runtime": 5001,
-        "clat_ns": {"min": 90000, "max": 3000000, "mean": 187456.7}}}]}"#;
-
     #[test]
     fn parses_fio_json() {
-        let p = parse_fio(SEQ, RAND, "4M").unwrap();
-        assert_eq!(p.bs, "4M");
+        let json = r#"{"fio version": "fio-3.33", "jobs": [{"jobname": "abe", "write": {
+            "io_bytes": 104857600, "bw_bytes": 20480000, "bw": 20000, "iops": 5000.0,
+            "runtime": 5004, "clat_ns": {"min": 90000, "max": 3000000, "mean": 187456.7}}}]}"#;
+        let p = parse_fio(json, "4k", 1).unwrap();
+        assert_eq!(p.bs, "4k");
+        assert_eq!(p.iodepth, 1);
         assert_eq!(p.seconds, 5.0);
-        assert_eq!(p.write_mib_s, 1227.71);
-        assert_eq!(p.write_iops, 306.94);
-        assert_eq!(p.write_lat_ms, 26.01);
-        assert_eq!(p.lat_4k_us, 187.46);
+        assert_eq!(p.write_mib_s, 19.53);
+        assert_eq!(p.write_iops, 5000.0);
+        assert_eq!(p.write_lat_us, 187.46);
     }
 
     #[test]
     fn fio_without_results_is_none() {
-        assert_eq!(parse_fio("", RAND, "4M"), None);
-        assert_eq!(parse_fio(r#"{"jobs": []}"#, RAND, "4M"), None);
-        assert_eq!(parse_fio(r#"{"jobs": [{"read": {"bw_bytes": 1}}]}"#, RAND, "4M"), None);
-        assert_eq!(parse_fio(SEQ, "", "4M"), None);
+        assert_eq!(parse_fio("", "4k", 1), None);
+        assert_eq!(parse_fio(r#"{"jobs": []}"#, "4k", 1), None);
+        assert_eq!(parse_fio(r#"{"jobs": [{"read": {"bw_bytes": 1}}]}"#, "4k", 1), None);
     }
 
     #[test]
