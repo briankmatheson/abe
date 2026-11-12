@@ -1,21 +1,16 @@
 use if_addrs::get_if_addrs;
-use nix::libc::int16_t;
 use nix::mount::{MsFlags, mount};
 use nix::unistd::symlinkat;
 use std::path::PathBuf;
 use std::fs::{self, File, write};
-use std::io::{Result, Write, Read, Error, ErrorKind};
+use std::io::{Result, Write, Error, ErrorKind};
 use std::fmt::Display;
 use std::path::Path;
 use std::process::Command;
 use std::env::var;
-use std::net::Ipv4Addr;
-use std::net::SocketAddr;
 use std::str;
 use uuid::Uuid;
-use ipnet::Ipv4Net;
-use env_logger::Env;
-use log::{info, warn};
+use log::{error, info, warn};
 use axum::{
     extract::{Path as EP, Query},
     http::StatusCode,
@@ -285,7 +280,7 @@ fn characterize(dev: &str, bytes: u64) -> Result<Option<Perf>> {
         .output()?;
     check(out.clone(), "fio")?;
     let perf = parse_fio(&String::from_utf8_lossy(&out.stdout), &bs, iodepth)
-        .ok_or_else(|| Error::new(ErrorKind::Other, "fio printed no write results"))?;
+        .ok_or_else(|| Error::other("fio printed no write results"))?;
     info!("fio on {dev}: {:.0} us mean latency, {:.0} IOPS, {:.1} MiB/s at bs={bs} iodepth={iodepth}",
           perf.write_lat_us, perf.write_iops, perf.write_mib_s);
     Ok(Some(perf))
@@ -477,7 +472,7 @@ fn vg_space() -> Result<(u64, u64)> {
         .output()?;
     check(out.clone(), "vgs")?;
     let text = String::from_utf8_lossy(&out.stdout);
-    parse_vgs(&text).ok_or_else(|| Error::new(ErrorKind::Other, format!("cannot parse vgs output {:?}", text.trim())))
+    parse_vgs(&text).ok_or_else(|| Error::other(format!("cannot parse vgs output {:?}", text.trim())))
 }
 
 fn parse_vgs(text: &str) -> Option<(u64, u64)> {
@@ -541,7 +536,7 @@ fn summarize(vg: &str, pool: Option<&str>, lvs: &[Lv], vg_bytes: u64, vg_free: u
         let p = lvs.iter().find(|l| l.name == pool && l.segtype == "thin-pool")
             .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no thin pool {vg}/{pool}")))?;
         let pct = p.data_percent
-            .ok_or_else(|| Error::new(ErrorKind::Other, format!("thin pool {vg}/{pool} reports no usage (inactive?)")))?;
+            .ok_or_else(|| Error::other(format!("thin pool {vg}/{pool} reports no usage (inactive?)")))?;
         u.bytes = p.bytes;
         u.used_bytes = percent_of(p.bytes, pct).min(p.bytes);
         u.free_bytes = p.bytes - u.used_bytes;
@@ -691,7 +686,7 @@ async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
 	
 
     let port  = Port::create(id.clone(), &svc_port, "tcp", i).map_err(|e| api_err("nvmet port", e))?;
-    port.link_subsystem(&target);
+    port.link_subsystem(&target).map_err(|e| api_err("nvmet port link", e))?;
 	
     println!("{} {}:{}", port.id, port.traddr, port.trsvcid);
     
@@ -723,7 +718,7 @@ impl Subsystem {
         fs::create_dir_all(&path)?;
 
         info!("allowing any host");
-        fs::write(format!("{}/attr_allow_any_host", path), "1");
+        fs::write(format!("{}/attr_allow_any_host", path), "1")?;
         Ok(Self {
             name: name.to_string(),
         })
@@ -734,7 +729,7 @@ impl Subsystem {
             NVMET_PATH, self.name, nsid
         );
         info!("making namespace {ns_path}");     
-        fs::create_dir_all(&ns_path);
+        fs::create_dir_all(&ns_path)?;
 
         info!("adding device {device_path}");
         File::create(format!("{}/device_path", ns_path))?.write_all(device_path.as_bytes())?;
@@ -768,31 +763,24 @@ impl Port {
         // nvmet-tcp accepts 0.0.0.0 to listen on every interface; override
         // with ABE_TRADDR to pin a specific one.
         let traddr: String = bind_traddr();
-	let mut trsvcid: String = svcid.to_string();
-        let result = fs::create_dir_all(&path);
-	if result.is_ok() {
-            info!("writing addr_traddr {path}");
-            File::create(format!("{}/addr_traddr", path))?.write_all(traddr.as_bytes())?;
+	let trsvcid: String = svcid.to_string();
+        fs::create_dir_all(&path)?;
+        info!("writing addr_traddr {path}");
+        File::create(format!("{}/addr_traddr", path))?.write_all(traddr.as_bytes())?;
 	    
-            info!("writing addr_trsvcid{path}");
-            File::create(format!("{}/addr_trsvcid", path))?.write_all(trsvcid.as_bytes())?;
+        info!("writing addr_trsvcid{path}");
+        File::create(format!("{}/addr_trsvcid", path))?.write_all(trsvcid.as_bytes())?;
 	    
-            info!("making addr_trtype {path}");
-            File::create(format!("{}/addr_trtype", path))?.write_all(trtype.as_bytes())?;
+        info!("making addr_trtype {path}");
+        File::create(format!("{}/addr_trtype", path))?.write_all(trtype.as_bytes())?;
 	    
-            info!("making addr_adrfam {path}");
-            File::create(format!("{}/addr_adrfam", path))?.write_all("ipv4".as_bytes())?;
-	} else {
-	    // find the old stuff
-	    let mut buffer: [u8; 1024] = [0; 1024];
-	    File::open("{path}/addr_trsvcid")?.read(&mut buffer)?;
-	    let trsvcid = str::from_utf8_mut(&mut buffer).unwrap();
-	}
+        info!("making addr_adrfam {path}");
+        File::create(format!("{}/addr_adrfam", path))?.write_all("ipv4".as_bytes())?;
         Ok(Port{
-	    id: id, 
-	    traddr: traddr, 
-	    trsvcid: trsvcid, 
-	    iteration: iteration
+	    id, 
+	    traddr, 
+	    trsvcid, 
+	    iteration
 	})
     }
     
@@ -882,7 +870,7 @@ fn check(output: std::process::Output, what: &str) -> Result<()> {
     }
     let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
     warn!("{what} failed: {err}");
-    Err(Error::new(ErrorKind::Other, format!("{what} failed: {err}")))
+    Err(Error::other(format!("{what} failed: {err}")))
 }    
 
 
@@ -890,8 +878,10 @@ fn check(output: std::process::Output, what: &str) -> Result<()> {
 async fn main() {
     env_logger::init();
     
-    ensure_configfs_mounted();
-    ensure_nvmet_present();
+    if let Err(e) = ensure_configfs_mounted().and_then(|_| ensure_nvmet_present()) {
+        error!("cannot set up nvmet: {e}");
+        std::process::exit(1);
+    }
 
     let app = Router::new()
         .route("/id/:id", get(attach).delete(detach))
