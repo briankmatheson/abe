@@ -71,11 +71,14 @@ does too, `/utilization` lists it under `warnings`, and abe logs it.
 
 Replies carry `id`, `port` (nvmet trsvcid), `traddr`, `nqn` (== id) and a
 ready-to-run `nvme connect` line in `message`. `/configure` also runs
-fio on the new volume -- `ABE_FIO_SECONDS` (default 5, 0 disables) of
-sequential direct writes at `ABE_FIO_BS` (default 4M) -- and reports
-`perf`: `write_mib_s`, `write_iops`, `write_lat_ms` (mean completion
-latency), `bs`, `seconds`. The same numbers go to the log, so the pool's
-behaviour over time is in the journal. Each namespace is exported
+fio on the new volume, `ABE_FIO_SECONDS` (default 5, 0 disables) each of
+sequential direct writes at `ABE_FIO_BS` (default 4M, 8 in flight) and of
+4k random writes one at a time over the first GiB, and reports `perf`:
+`write_mib_s`, `write_iops`, `write_lat_ms` (mean completion latency of
+the sequential run), `lat_4k_us` (mean completion latency of one 4k
+write, what a synchronous IO costs on this pool), `bs`, `seconds`. The
+same numbers go to the log, so the pool's behaviour over time is in the
+journal. Each namespace is exported
 with `device_uuid` set to the volume id, so initiators get a stable
 `/dev/disk/by-id/nvme-uuid.<dashed id>` path.
 

@@ -123,16 +123,20 @@ struct Message {
     perf: Option<Perf>,
 }
 
-/// A short sequential-write run on a new volume, before it is handed out:
-/// how fast this pool takes 4M writes right now.
+/// Two short fio runs on a new volume, before it is handed out: how fast
+/// this pool takes 4M sequential writes right now (bandwidth), and the
+/// mean completion latency of a single outstanding 4k random write
+/// (what one synchronous IO costs on this pool).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct Perf {
     bs: String,
     seconds: f64,
     write_mib_s: f64,
     write_iops: f64,
-    /// mean completion latency
+    /// mean completion latency of the sequential run (bs, iodepth 8)
     write_lat_ms: f64,
+    /// mean completion latency, 4k random write, iodepth 1
+    lat_4k_us: f64,
 }
 
 /// How long fio writes to each new volume (ABE_FIO_SECONDS, default 5;
@@ -243,7 +247,8 @@ async fn configure(Query(p): Query<ConfigureParams>) -> std::result::Result<Json
     // Measure after the export is set up so a fio problem cannot cost the
     // caller its volume; the data written is garbage on a blank volume.
     let dev = lv_path_for_uuid(&id);
-    m.perf = match tokio::task::spawn_blocking(move || characterize(&dev)).await {
+    let bytes = m.bytes.unwrap_or(1 << 30);
+    m.perf = match tokio::task::spawn_blocking(move || characterize(&dev, bytes)).await {
         Ok(Ok(p)) => p,
         Ok(Err(e)) => { warn!("fio on {id}: {e}"); None }
         Err(e) => { warn!("fio task on {id}: {e}"); None }
@@ -251,45 +256,67 @@ async fn configure(Query(p): Query<ConfigureParams>) -> std::result::Result<Json
     Ok(Json(m))
 }
 
-/// Sequential writes with fio for ABE_FIO_SECONDS at ABE_FIO_BS, direct
-/// I/O, straight at the LV. Ok(None) when disabled.
-fn characterize(dev: &str) -> Result<Option<Perf>> {
+/// Direct-I/O fio straight at the LV, ABE_FIO_SECONDS each: sequential
+/// writes at ABE_FIO_BS with 8 in flight, then 4k random writes one at a
+/// time over the first GiB (which the sequential pass has just allocated,
+/// so thin-pool chunk allocation does not land in the latency figure).
+/// Ok(None) when disabled.
+fn characterize(dev: &str, bytes: u64) -> Result<Option<Perf>> {
     let secs = fio_seconds();
     if secs == 0 {
         return Ok(None);
     }
     let bs = fio_bs();
+    let secs = secs.to_string();
     info!("fio: {secs}s of {bs} sequential writes on {dev}");
-    let out = Command::new("fio")
-        .args(["--name=abe", "--filename", dev, "--rw=write", "--bs", &bs,
-               "--direct=1", "--ioengine=libaio", "--iodepth=8",
-               "--time_based", "--runtime", &secs.to_string(),
-               "--output-format=json"])
-        .output()?;
-    check(out.clone(), "fio")?;
-    let perf = parse_fio(&String::from_utf8_lossy(&out.stdout), &bs)
+    let seq = fio(&["--name=abe-seq", "--filename", dev, "--rw=write", "--bs", &bs,
+                    "--iodepth=8", "--runtime", &secs])?;
+    let region = bytes.min(1 << 30).to_string();
+    info!("fio: {secs}s of 4k random writes, iodepth 1, on the first {region} bytes of {dev}");
+    let rand = fio(&["--name=abe-4k", "--filename", dev, "--rw=randwrite", "--bs=4k",
+                     "--iodepth=1", "--size", &region, "--runtime", &secs])?;
+    let perf = parse_fio(&seq, &rand, &bs)
         .ok_or_else(|| Error::new(ErrorKind::Other, "fio printed no write results"))?;
-    info!("fio on {dev}: {:.0} MiB/s, {:.0} IOPS, {:.2} ms mean latency at bs={bs}",
-          perf.write_mib_s, perf.write_iops, perf.write_lat_ms);
+    info!("fio on {dev}: {:.0} MiB/s, {:.0} IOPS, {:.2} ms mean latency at bs={bs}; 4k qd1 {:.0} us",
+          perf.write_mib_s, perf.write_iops, perf.write_lat_ms, perf.lat_4k_us);
     Ok(Some(perf))
 }
 
-/// Pull the write numbers out of `fio --output-format=json`.
-fn parse_fio(json: &str, bs: &str) -> Option<Perf> {
+/// One fio job with the common flags, JSON on stdout.
+fn fio(args: &[&str]) -> Result<String> {
+    let out = Command::new("fio")
+        .args(["--direct=1", "--ioengine=libaio", "--time_based", "--output-format=json"])
+        .args(args)
+        .output()?;
+    check(out.clone(), "fio")?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The write section of the first job in `fio --output-format=json`.
+fn fio_write(json: &str) -> Option<serde_json::Value> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let job = v.get("jobs")?.as_array()?.first()?;
-    let w = job.get("write")?;
+    v.get("jobs")?.as_array()?.first()?.get("write").cloned()
+}
+
+fn fio_clat_mean_ns(w: &serde_json::Value) -> f64 {
+    w.get("clat_ns").and_then(|c| c.get("mean")).and_then(|m| m.as_f64()).unwrap_or(0.0)
+}
+
+/// Pull the numbers out of the two fio runs.
+fn parse_fio(seq_json: &str, rand_json: &str, bs: &str) -> Option<Perf> {
+    let w = fio_write(seq_json)?;
     let runtime_ms = w.get("runtime")?.as_f64()?;
     let bw_bytes = w.get("bw_bytes")?.as_f64()?;
     let iops = w.get("iops")?.as_f64()?;
-    let lat_ns = w.get("clat_ns").and_then(|c| c.get("mean")).and_then(|m| m.as_f64()).unwrap_or(0.0);
+    let r = fio_write(rand_json)?;
     let round = |x: f64| (x * 100.0).round() / 100.0;
     Some(Perf {
         bs: bs.to_string(),
         seconds: round(runtime_ms / 1000.0),
         write_mib_s: round(bw_bytes / (1024.0 * 1024.0)),
         write_iops: round(iops),
-        write_lat_ms: round(lat_ns / 1e6),
+        write_lat_ms: round(fio_clat_mean_ns(&w) / 1e6),
+        lat_4k_us: round(fio_clat_mean_ns(&r) / 1e3),
     })
 }
 
@@ -1049,24 +1076,30 @@ mod tests {
         assert!(summarize("timesink-vg", Some("root"), &lvs, 1, 1).is_err());
     }
 
+    const SEQ: &str = r#"{"fio version": "fio-3.33", "jobs": [{"jobname": "abe-seq", "write": {
+        "io_bytes": 6442450944, "bw_bytes": 1287350000, "bw": 1257177, "iops": 306.94,
+        "runtime": 5004, "clat_ns": {"min": 1000, "max": 90000000, "mean": 26012345.6}}}]}"#;
+    const RAND: &str = r#"{"jobs": [{"jobname": "abe-4k", "write": {
+        "bw_bytes": 20480000, "iops": 5000.0, "runtime": 5001,
+        "clat_ns": {"min": 90000, "max": 3000000, "mean": 187456.7}}}]}"#;
+
     #[test]
     fn parses_fio_json() {
-        let json = r#"{"fio version": "fio-3.33", "jobs": [{"jobname": "abe", "write": {
-            "io_bytes": 6442450944, "bw_bytes": 1287350000, "bw": 1257177, "iops": 306.94,
-            "runtime": 5004, "clat_ns": {"min": 1000, "max": 90000000, "mean": 26012345.6}}}]}"#;
-        let p = parse_fio(json, "4M").unwrap();
+        let p = parse_fio(SEQ, RAND, "4M").unwrap();
         assert_eq!(p.bs, "4M");
         assert_eq!(p.seconds, 5.0);
         assert_eq!(p.write_mib_s, 1227.71);
         assert_eq!(p.write_iops, 306.94);
         assert_eq!(p.write_lat_ms, 26.01);
+        assert_eq!(p.lat_4k_us, 187.46);
     }
 
     #[test]
     fn fio_without_results_is_none() {
-        assert_eq!(parse_fio("", "4M"), None);
-        assert_eq!(parse_fio(r#"{"jobs": []}"#, "4M"), None);
-        assert_eq!(parse_fio(r#"{"jobs": [{"read": {"bw_bytes": 1}}]}"#, "4M"), None);
+        assert_eq!(parse_fio("", RAND, "4M"), None);
+        assert_eq!(parse_fio(r#"{"jobs": []}"#, RAND, "4M"), None);
+        assert_eq!(parse_fio(r#"{"jobs": [{"read": {"bw_bytes": 1}}]}"#, RAND, "4M"), None);
+        assert_eq!(parse_fio(SEQ, "", "4M"), None);
     }
 
     #[test]
