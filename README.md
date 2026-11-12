@@ -71,12 +71,14 @@ does too, `/utilization` lists it under `warnings`, and abe logs it.
 
 Replies carry `id`, `port` (nvmet trsvcid), `traddr`, `nqn` (== id) and a
 ready-to-run `nvme connect` line in `message`. `/configure` also runs
-fio on the new volume for `ABE_FIO_SECONDS` (default 5, 0 disables):
-random direct writes at `ABE_FIO_BS` (default 4k) with `ABE_FIO_IODEPTH`
-(default 1) in flight over the first GiB, and reports `perf`:
+fio on the new volume: random direct writes at `ABE_FIO_BS` (default 4k)
+with `ABE_FIO_IODEPTH` (default 1) in flight over the first GiB, for
+`ABE_FIO_RAMP` seconds of unmeasured warm-up (default 3; queues, caches
+and the first thin-chunk allocations settle) and then `ABE_FIO_SECONDS`
+measured (default 5, 0 disables the run), and reports `perf`:
 `write_lat_us` (mean completion latency: what one synchronous small
-write costs on this pool, chunk allocation included since the volume is
-new), `write_iops`, `write_mib_s`, `bs`, `iodepth`, `seconds`. The same
+write costs on this pool), `write_iops`, `write_mib_s`, `bs`, `iodepth`,
+`seconds` (the measured window). The same
 numbers go to the log, so the pool's behaviour over time is in the
 journal. Each namespace is exported
 with `device_uuid` set to the volume id, so initiators get a stable

@@ -139,13 +139,17 @@ struct Perf {
 }
 
 /// How long fio writes to each new volume (ABE_FIO_SECONDS, default 5;
-/// 0 disables), with what block size (ABE_FIO_BS, default 4k) and how
-/// many in flight (ABE_FIO_IODEPTH, default 1).
+/// 0 disables), after how long a warm-up that is not measured
+/// (ABE_FIO_RAMP, default 3), with what block size (ABE_FIO_BS, default
+/// 4k) and how many in flight (ABE_FIO_IODEPTH, default 1).
 fn fio_seconds() -> u64 {
     var("ABE_FIO_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5)
 }
 fn fio_bs() -> String {
     var("ABE_FIO_BS").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "4k".to_string())
+}
+fn fio_ramp() -> u64 {
+    var("ABE_FIO_RAMP").ok().and_then(|s| s.parse().ok()).unwrap_or(3)
 }
 fn fio_iodepth() -> u32 {
     var("ABE_FIO_IODEPTH").ok().and_then(|s| s.parse().ok()).filter(|&d| d > 0).unwrap_or(1)
@@ -259,24 +263,24 @@ async fn configure(Query(p): Query<ConfigureParams>) -> std::result::Result<Json
     Ok(Json(m))
 }
 
-/// Direct-I/O fio straight at the LV for ABE_FIO_SECONDS: random writes
-/// at ABE_FIO_BS, ABE_FIO_IODEPTH in flight, over the first GiB. A fresh
-/// thin volume allocates chunks as they are first written, so this is
-/// what a new volume really costs, allocation included. Ok(None) when
-/// disabled.
+/// Direct-I/O fio straight at the LV: random writes at ABE_FIO_BS,
+/// ABE_FIO_IODEPTH in flight, over the first GiB, ABE_FIO_RAMP seconds of
+/// warm-up that fio does not count (device queues, caches and the first
+/// thin-chunk allocations settle), then ABE_FIO_SECONDS measured.
+/// Ok(None) when disabled.
 fn characterize(dev: &str, bytes: u64) -> Result<Option<Perf>> {
     let secs = fio_seconds();
     if secs == 0 {
         return Ok(None);
     }
-    let (bs, iodepth) = (fio_bs(), fio_iodepth());
+    let (bs, iodepth, ramp) = (fio_bs(), fio_iodepth(), fio_ramp());
     let region = bytes.min(1 << 30);
-    info!("fio: {secs}s of {bs} random writes, iodepth {iodepth}, on the first {region} bytes of {dev}");
+    info!("fio: {ramp}s warm-up then {secs}s of {bs} random writes, iodepth {iodepth}, on the first {region} bytes of {dev}");
     let out = Command::new("fio")
         .args(["--name=abe", "--filename", dev, "--rw=randwrite", "--bs", &bs,
                "--iodepth", &iodepth.to_string(), "--size", &region.to_string(),
                "--direct=1", "--ioengine=libaio",
-               "--time_based", "--runtime", &secs.to_string(),
+               "--time_based", "--ramp_time", &ramp.to_string(), "--runtime", &secs.to_string(),
                "--output-format=json"])
         .output()?;
     check(out.clone(), "fio")?;
