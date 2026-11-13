@@ -21,6 +21,10 @@ if-addrs = "0.13.4"
 chrono = { version = "0.4", features = ["serde"] }
 
 [package.metadata.deb]
+name = "abe-block-exporter"
+# Debian ships an unrelated SDL game as "abe"; same binary name, so never both.
+conflicts = "abe"
+replaces = "abe"
 maintainer = "Brian Matheson <brian@brianmatheson.com>"
 copyright = "2024, Brian Matheson <brian@brianmatheson.com>"
 section = "admin"

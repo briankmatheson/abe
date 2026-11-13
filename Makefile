@@ -4,7 +4,7 @@
 #   make test            cargo test + tests/lint-links.sh
 #   make lint            fmt --check + clippy
 #   make e2e             sudo tests/e2e.sh (needs a thin pool, fio, nvme-cli)
-#   make deb             target/debian/abe_<ver>-1_<arch>.deb (needs cargo-deb)
+#   make deb             target/debian/abe-block-exporter_<ver>-1_<arch>.deb (needs cargo-deb)
 #   make install         install that .deb on this box
 #   make deploy HOSTS="timesink gram"   scp + install the .deb on remote boxes
 #   make tag             git tag v<ver> from Cargo.toml (annotated)
@@ -16,7 +16,7 @@ SHELL    := /bin/bash
 CARGO    ?= cargo
 VERSION  := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 ARCH     := $(shell dpkg --print-architecture 2>/dev/null || echo amd64)
-DEB      := target/debian/abe_$(VERSION)-1_$(ARCH).deb
+DEB      := target/debian/abe-block-exporter_$(VERSION)-1_$(ARCH).deb
 HOSTS    ?=
 SSH_USER ?= $(USER)
 
@@ -54,12 +54,9 @@ deb:
 
 $(DEB): deb
 
-# Debian ships an unrelated package also called "abe" (the SDL game). If it is
-# installed, apt sees our version as a downgrade; remove it first.
+# The package Conflicts with Debian's unrelated "abe" (an SDL game), so apt
+# removes that one if it is installed.
 install: $(DEB)
-	@if dpkg -s abe 2>/dev/null | grep -q "^Version: 1\."; then \
-	  echo "the Debian 'abe' game is installed; removing it first"; \
-	  sudo apt remove -y abe abe-data; fi
 	sudo apt install -y ./$(DEB)
 
 # make deploy HOSTS="timesink gram"  (ssh as $(SSH_USER); sudo must work there)
