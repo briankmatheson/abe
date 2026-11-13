@@ -66,7 +66,7 @@ $(DEB): deb
 # Conflicts with Debian's unrelated "abe" (an SDL game): apt errors out if
 # that is installed. Remove it yourself (apt remove abe abe-data) first.
 install: $(DEB)
-	sudo apt install -y --reinstall ./$(DEB) && sudo systemctl restart abe
+	sudo apt install -y --reinstall -o Dpkg::Options::=--force-confold ./$(DEB) && sudo systemctl restart abe
 	@$(VERIFY)
 
 # make deploy HOSTS="timesink gram"  (ssh as $(SSH_USER); sudo must work there)
@@ -75,7 +75,7 @@ deploy: $(DEB)
 	@for h in $(HOSTS); do \
 	  echo "== $$h"; \
 	  scp $(DEB) $(SSH_USER)@$$h:/tmp/ && \
-	  ssh -t $(SSH_USER)@$$h "sudo apt install -y --reinstall /tmp/$(notdir $(DEB)) && sudo systemctl restart abe && systemctl is-active abe; $(REMOTE_VERIFY)" || exit 1; \
+	  ssh -t $(SSH_USER)@$$h "sudo apt install -y --reinstall -o Dpkg::Options::=--force-confold /tmp/$(notdir $(DEB)) && sudo systemctl restart abe && systemctl is-active abe; $(REMOTE_VERIFY)" || exit 1; \
 	done
 
 tag:
