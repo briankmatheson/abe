@@ -22,14 +22,15 @@ DEB      := target/debian/abe-block-exporter_$(VERSION)-$(REVISION)_$(ARCH).deb
 HOSTS    ?=
 SSH_USER ?= $(USER)
 
-# GET /version on the box after an install, with the TLS settings from its
+# GET /version on the box after an install (up to ten seconds: abe binds the
+# API only after its fence and re-export pass), with the TLS settings from its
 # /etc/default/abe (same derivation as tests/e2e.sh; sudo reads the key).
 # VERIFY runs locally; REMOTE_VERIFY is the same inside an ssh "..." string.
 VERIFY := . /etc/default/abe 2>/dev/null; \
   if [ x$${ABE_TLS:-on} = xoff ]; then CURL=curl; S=http; \
   else CURL='sudo curl --cacert '$${ABE_TLS_CA:-/etc/abe/ca.pem}' --cert '$${ABE_TLS_CERT:-/etc/abe/cert.pem}' --key '$${ABE_TLS_KEY:-/etc/abe/key.pem}; S=https; fi; \
   U=$$S://$$(echo $${ABE_LISTEN:-127.0.0.1:443} | sed s/0.0.0.0/127.0.0.1/)/version; \
-  $$CURL -sf $$U && echo || { echo '!! abe is not answering' $$U '-- see: sudo journalctl -u abe -n 20 and /etc/default/abe'; false; }
+  for i in 1 2 3 4 5 6 7 8 9 10; do $$CURL -sf $$U && { echo; break; }; [ $$i = 10 ] && { echo '!! abe is not answering' $$U '-- see: sudo journalctl -u abe -n 20 and /etc/default/abe'; exit 1; }; sleep 1; done
 REMOTE_VERIFY = $(subst $$,\$$,$(VERIFY))
 
 .DEFAULT_GOAL := build
