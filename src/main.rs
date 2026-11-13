@@ -10,12 +10,12 @@ use log::{error, info, warn};
 use nix::mount::{mount, MsFlags};
 use nix::unistd::symlinkat;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env::var;
 use std::fmt::Display;
 use std::fs::{self, write, File};
 use std::io::{BufReader, Error, ErrorKind, Result, Write};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str;
@@ -177,6 +177,241 @@ fn tls_config_from(cert: &Path, key: &Path, ca: &Path) -> Result<Arc<rustls::Ser
 fn tls_config() -> Result<Arc<rustls::ServerConfig>> {
     let (cert, key, ca) = tls_paths();
     tls_config_from(&cert, &key, &ca)
+}
+
+// ---- the nvmet fence ---------------------------------------------------
+//
+// nvmet has no per-client authentication worth the name, so abe keeps an
+// nftables table of its own: a set of (client ip, port) pairs and a chain
+// that resets every other connection to the port range. A port is opened
+// to the address the API call came from (the TLS peer), never to a
+// parameter, so reaching a volume needs a cert *and* that address.
+
+/// The nft binary: ABE_NFT, else `nft` on PATH, else /usr/sbin/nft.
+fn nft_bin() -> PathBuf {
+    if let Some(p) = var("ABE_NFT").ok().filter(|s| !s.is_empty()) {
+        return PathBuf::from(p);
+    }
+    if let Ok(path) = var("PATH") {
+        for d in path.split(':').filter(|d| !d.is_empty()) {
+            let p = Path::new(d).join("nft");
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    PathBuf::from("/usr/sbin/nft")
+}
+
+/// Run nft with `args` (and `script` on stdin); its stdout. The error
+/// carries nft's stderr.
+fn nft(args: &[&str], script: Option<&str>) -> Result<String> {
+    use std::process::Stdio;
+    let bin = nft_bin();
+    let mut cmd = Command::new(&bin);
+    cmd.args(args)
+        .stdin(if script.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Error::new(e.kind(), format!("{}: {e}", bin.display())))?;
+    if let Some(text) = script {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        return Err(Error::other(format!(
+            "nft {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The whole `inet abe` table for the port range `min..=max`, with
+/// `elements` already in the set, as one `nft -f` transaction. `destroy`
+/// (nft >= 1.0.7) so a missing table is not an error. `accept` only ends
+/// this chain: other base chains on input still run.
+fn fence_script(min: u16, max: u16, elements: &[(Ipv4Addr, u16)]) -> String {
+    let elems = if elements.is_empty() {
+        String::new()
+    } else {
+        let list: Vec<String> = elements
+            .iter()
+            .map(|(ip, port)| format!("{ip} . {port}"))
+            .collect();
+        format!("        elements = {{ {} }}", list.join(", "))
+    };
+    [
+        "destroy table inet abe".to_string(),
+        "table inet abe {".to_string(),
+        "    set allowed {".to_string(),
+        "        type ipv4_addr . inet_service".to_string(),
+        "        comment \"client ip . nvmet port opened by abe\"".to_string(),
+        elems,
+        "    }".to_string(),
+        "    chain input {".to_string(),
+        "        type filter hook input priority filter - 10; policy accept;".to_string(),
+        format!("        tcp dport {min}-{max}  ip saddr . tcp dport @allowed  accept"),
+        format!("        tcp dport {min}-{max}  reject with tcp reset"),
+        format!("        meta nfproto ipv6  tcp dport {min}-{max}  reject with tcp reset"),
+        "    }".to_string(),
+        "}".to_string(),
+    ]
+    .into_iter()
+    .filter(|l| !l.is_empty())
+    .map(|l| l + "\n")
+    .collect()
+}
+
+/// The table with an empty set.
+fn fence_script_for_range(min: u16, max: u16) -> String {
+    fence_script(min, max, &[])
+}
+
+/// Replace the `inet abe` table atomically with one that allows exactly
+/// `elements`. Under OPS when exports exist.
+fn fence_install(elements: &[(Ipv4Addr, u16)]) -> Result<()> {
+    let (min, max) = port_bounds();
+    nft(&["-f", "-"], Some(&fence_script(min, max, elements)))?;
+    info!(
+        "fence: table inet abe installed for {min}-{max} with {} element(s)",
+        elements.len()
+    );
+    Ok(())
+}
+
+/// Under OPS: `port` is reachable from `ip` and nobody else.
+fn fence_open(ip: Ipv4Addr, port: u16) -> Result<()> {
+    fence_close_port(port)?;
+    nft(
+        &[
+            "add",
+            "element",
+            "inet",
+            "abe",
+            "allowed",
+            &format!("{{ {ip} . {port} }}"),
+        ],
+        None,
+    )?;
+    info!("fence: opened {port} to {ip}");
+    Ok(())
+}
+
+/// Under OPS: drop every element for `port`. A port that was not open,
+/// or no table at all, is not an error.
+fn fence_close_port(port: u16) -> Result<()> {
+    let open = match nft(&["-j", "list", "set", "inet", "abe", "allowed"], None) {
+        Ok(json) => parse_nft_set_json(&json)?,
+        Err(e) if e.to_string().contains("No such file or directory") => {
+            warn!("fence: no table inet abe while closing {port} (GET /reexport rebuilds it)");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    for (p, ip) in open {
+        if p != port {
+            continue;
+        }
+        info!("closing {port} (was open to {ip})");
+        nft(
+            &[
+                "delete",
+                "element",
+                "inet",
+                "abe",
+                "allowed",
+                &format!("{{ {ip} . {port} }}"),
+            ],
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// What the fence allows right now: port -> client.
+fn fence_list() -> Result<BTreeMap<u16, Ipv4Addr>> {
+    let json = nft(&["-j", "list", "set", "inet", "abe", "allowed"], None)?;
+    parse_nft_set_json(&json)
+}
+
+/// The `(ip, port)` elements in `nft -j list set inet abe allowed`.
+fn parse_nft_set_json(json: &str) -> Result<BTreeMap<u16, Ipv4Addr>> {
+    let v: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("nft -j: {e}")))?;
+    let mut map = BTreeMap::new();
+    let Some(objs) = v.get("nftables").and_then(|n| n.as_array()) else {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "nft -j: no nftables array",
+        ));
+    };
+    for set in objs.iter().filter_map(|o| o.get("set")) {
+        let Some(elems) = set.get("elem").and_then(|e| e.as_array()) else {
+            continue;
+        };
+        for e in elems {
+            let Some(c) = e.get("concat").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            let ip = c
+                .first()
+                .and_then(|x| x.as_str())
+                .and_then(|x| x.parse().ok());
+            let port = c
+                .get(1)
+                .and_then(|x| x.as_u64())
+                .and_then(|x| u16::try_from(x).ok());
+            if let (Some(ip), Some(port)) = (ip, port) {
+                map.insert(port, ip);
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// The distinct remote addresses with an established TCP connection to
+/// local `port`, from a `/proc/net/tcp` body. Addresses there are hex in
+/// host byte order (little-endian on x86: 0100007F is 127.0.0.1).
+fn peers_on_port(proc_net_tcp: &str, port: u16) -> BTreeSet<Ipv4Addr> {
+    let mut peers = BTreeSet::new();
+    for line in proc_net_tcp.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 4 || f[3] != "01" {
+            continue;
+        }
+        let (Some((_, lport)), Some((rip, _))) = (f[1].split_once(':'), f[2].split_once(':'))
+        else {
+            continue;
+        };
+        if u16::from_str_radix(lport, 16).ok() != Some(port) {
+            continue;
+        }
+        if let Ok(raw) = u32::from_str_radix(rip, 16) {
+            peers.insert(Ipv4Addr::from(raw.swap_bytes()));
+        }
+    }
+    peers
+}
+
+/// Who is connected to `port` right now.
+fn established_peers(port: u16) -> BTreeSet<Ipv4Addr> {
+    match fs::read_to_string("/proc/net/tcp") {
+        Ok(t) => peers_on_port(&t, port),
+        Err(e) => {
+            warn!("/proc/net/tcp: {e}");
+            BTreeSet::new()
+        }
+    }
 }
 
 /// Volume ids are v4 UUIDs without dashes; nvmet wants the dashed form for
@@ -2869,5 +3104,160 @@ mod tests {
             Ok(r) => panic!("served without a client certificate: {r}"),
         }
         server.abort();
+    }
+
+    // ---- the fence --------------------------------------------------------
+
+    const FENCE_SCRIPT: &str = "\
+destroy table inet abe
+table inet abe {
+    set allowed {
+        type ipv4_addr . inet_service
+        comment \"client ip . nvmet port opened by abe\"
+    }
+    chain input {
+        type filter hook input priority filter - 10; policy accept;
+        tcp dport 44001-44999  ip saddr . tcp dport @allowed  accept
+        tcp dport 44001-44999  reject with tcp reset
+        meta nfproto ipv6  tcp dport 44001-44999  reject with tcp reset
+    }
+}
+";
+
+    #[test]
+    fn fence_script_golden() {
+        assert_eq!(fence_script_for_range(44001, 44999), FENCE_SCRIPT);
+        let with = fence_script(
+            44001,
+            44999,
+            &[
+                ("10.22.0.1".parse().unwrap(), 44001),
+                ("10.23.0.2".parse().unwrap(), 44002),
+            ],
+        );
+        assert_eq!(
+            with,
+            FENCE_SCRIPT.replace(
+                "        comment \"client ip . nvmet port opened by abe\"\n",
+                "        comment \"client ip . nvmet port opened by abe\"\n        elements = { 10.22.0.1 . 44001, 10.23.0.2 . 44002 }\n"
+            )
+        );
+    }
+
+    /// The script really loads: run nft in a private user+network
+    /// namespace when the box allows that (no root needed); skipped
+    /// otherwise.
+    #[test]
+    fn fence_script_loads_in_a_namespace() {
+        let nft = ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file());
+        let (Some(nft), Ok(probe)) = (
+            nft,
+            Command::new("unshare").args(["-r", "-n", "true"]).output(),
+        ) else {
+            eprintln!("skipped: no nft or unshare");
+            return;
+        };
+        if !probe.status.success() {
+            eprintln!("skipped: unshare -r -n not permitted here");
+            return;
+        }
+        let script = fence_script(44001, 44999, &[("10.22.0.1".parse().unwrap(), 44001)]);
+        let one = |args: &[&str], stdin: &str| -> (bool, String) {
+            let mut c = Command::new("unshare")
+                .args(["-r", "-n", "sh", "-c"])
+                .arg(format!(
+                    "{nft} -f - && {nft} {} && {nft} -j list set inet abe allowed",
+                    args.join(" ")
+                ))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+            let o = c.wait_with_output().unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stdout).into_owned()
+                    + &String::from_utf8_lossy(&o.stderr),
+            )
+        };
+        // install twice (destroy of an existing table) then open one more
+        let (ok, out) = one(
+            &["add element inet abe allowed '{ 10.23.0.2 . 44002 }'"],
+            &format!("{script}{script}"),
+        );
+        assert!(ok, "{out}");
+        let set = parse_nft_set_json(&out).unwrap();
+        assert_eq!(
+            set.get(&44001).map(|ip| ip.to_string()).as_deref(),
+            Some("10.22.0.1")
+        );
+        assert_eq!(
+            set.get(&44002).map(|ip| ip.to_string()).as_deref(),
+            Some("10.23.0.2")
+        );
+        let (ok, out) = one(
+            &["delete element inet abe allowed '{ 10.22.0.1 . 44001 }'"],
+            &script,
+        );
+        assert!(ok, "{out}");
+        assert!(parse_nft_set_json(&out).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parses_nft_set_json() {
+        let json = r#"{"nftables":[{"metainfo":{"version":"1.1.7","release_name":"Commodore Bullmoose #8","json_schema_version":1}},{"set":{"family":"inet","name":"allowed","table":"abe","type":["ipv4_addr","inet_service"],"handle":2,"comment":"client ip . nvmet port opened by abe","elem":[{"concat":["10.22.0.1",44001]},{"concat":["10.23.0.2",44002]}]}}]}"#;
+        let m = parse_nft_set_json(json).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[&44001], "10.22.0.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(m[&44002], "10.23.0.2".parse::<Ipv4Addr>().unwrap());
+        // an empty set has no elem key at all
+        let empty = r#"{"nftables":[{"metainfo":{}},{"set":{"family":"inet","name":"allowed","table":"abe","type":["ipv4_addr","inet_service"]}}]}"#;
+        assert!(parse_nft_set_json(empty).unwrap().is_empty());
+        assert!(parse_nft_set_json("not json").is_err());
+        assert!(parse_nft_set_json("{}").is_err());
+    }
+
+    #[test]
+    fn finds_established_peers() {
+        // one established to 44001 from 10.22.0.1, one TIME_WAIT (06) to it
+        // from 10.22.0.9, one established to 44002, and the listener
+        let body = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100167F:ABE1 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0\n\
+   1: 0101160A:ABE1 0100160A:C350 01 00000000:00000000 00:00000000 00000000     0        0 12346 1 0000000000000000 20 4 30 10 -1\n\
+   2: 0101160A:ABE1 0900160A:C351 06 00000000:00000000 03:00000A1B 00000000     0        0 0 3 0000000000000000\n\
+   3: 0101160A:ABE2 0200170A:C352 01 00000000:00000000 00:00000000 00000000     0        0 12347 1 0000000000000000 20 4 30 10 -1\n\
+   4: 0101160A:ABE1 0100160A:C353 01 00000000:00000000 00:00000000 00000000     0        0 12348 1 0000000000000000 20 4 30 10 -1\n";
+        let p = peers_on_port(body, 44001);
+        assert_eq!(
+            p.into_iter().collect::<Vec<_>>(),
+            vec!["10.22.0.1".parse::<Ipv4Addr>().unwrap()]
+        );
+        let p = peers_on_port(body, 44002);
+        assert_eq!(
+            p.into_iter().collect::<Vec<_>>(),
+            vec!["10.23.0.2".parse::<Ipv4Addr>().unwrap()]
+        );
+        assert!(peers_on_port(body, 44003).is_empty());
+        assert!(peers_on_port("", 44001).is_empty());
+        // the loopback: 0100007F is 127.0.0.1
+        let lo = "header\n   0: 0100007F:ABE1 0100007F:C354 01 0 0 0 0 0 0 0 1\n";
+        assert_eq!(
+            peers_on_port(lo, 44001).into_iter().next(),
+            Some(Ipv4Addr::LOCALHOST)
+        );
+    }
+
+    #[test]
+    fn nft_binary_is_found() {
+        // ABE_NFT wins; otherwise PATH, then /usr/sbin/nft
+        std::env::set_var("ABE_NFT", "/opt/nft");
+        assert_eq!(nft_bin(), PathBuf::from("/opt/nft"));
+        std::env::remove_var("ABE_NFT");
+        let p = nft_bin();
+        assert_eq!(p.file_name().and_then(|n| n.to_str()), Some("nft"));
     }
 }
