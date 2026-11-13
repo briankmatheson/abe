@@ -273,6 +273,7 @@ fn fence_script(min: u16, max: u16, elements: &[(Ipv4Addr, u16)]) -> String {
 }
 
 /// The table with an empty set.
+#[cfg(test)]
 fn fence_script_for_range(min: u16, max: u16) -> String {
     fence_script(min, max, &[])
 }
@@ -561,6 +562,9 @@ struct Message {
     /// base volumes only: sealed bases are never exported (`port` is empty)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sealed: Option<bool>,
+    /// the address the port is fenced to: the caller's own
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client: Option<String>,
 }
 
 /// Reply of GET /seal/<id>.
@@ -599,6 +603,7 @@ impl Message {
             existing: false,
             base: None,
             sealed: None,
+            client: None,
         }
     }
 
@@ -615,6 +620,7 @@ impl Message {
             existing: true,
             base: Some(image.to_string()),
             sealed: Some(true),
+            client: None,
         }
     }
 }
@@ -696,6 +702,8 @@ struct Volume {
     sealed: bool,
     /// the caller's name for it (`abe_name` tag)
     name: Option<String>,
+    /// while exported: the address the fence opens its port to
+    client: Option<String>,
 }
 
 /// More snapshot layers than this under one volume earns a warning.
@@ -763,6 +771,9 @@ struct ReexportSummary {
     failed: Vec<String>,
     /// exported, but not on the port their abe_port tag named
     moved: usize,
+    /// exported with no client recorded and none connected, so the port
+    /// stays fenced shut until the next GET /id; the ids
+    closed: Vec<String>,
     /// RFC 3339 time of the pass
     at: String,
     /// some failures were EADDRNOTAVAIL (the underlay address is not up
@@ -809,6 +820,10 @@ fn reexport_all() -> ReexportSummary {
     reexport_locked()
 }
 
+/// The fence is rebuilt from scratch first: every export that is up
+/// already goes into the new table in the same transaction (to its
+/// recorded client, or the one peer connected to it), so a live
+/// connection never meets an empty table.
 fn reexport_locked() -> ReexportSummary {
     let mut s = ReexportSummary {
         at: now_rfc3339(),
@@ -826,6 +841,53 @@ fn reexport_locked() -> ReexportSummary {
     let (min, max) = port_bounds();
     let root = nvmet_path();
     let mut used = used_ports(Path::new(&root));
+
+    let mut keep = Vec::new();
+    let mut record = Vec::new();
+    for lv in &lvs {
+        if has_tag(&lv.tags, TAG_SEALED) {
+            continue;
+        }
+        let Some(port) = existing_export(&lv.name).and_then(|p| p.parse::<u16>().ok()) else {
+            continue;
+        };
+        let tagged = tag_value(&lv.tags, TAG_CLIENT).and_then(|v| v.parse::<Ipv4Addr>().ok());
+        let client = tagged.or_else(|| {
+            let peers = established_peers(port);
+            if peers.len() == 1 {
+                let ip = *peers.iter().next().unwrap();
+                info!("adopted {ip} for {} on {port}", lv.name);
+                Some(ip)
+            } else {
+                info!(
+                    "{} on {port}: no client recorded and {} connected; closed until attached again",
+                    lv.name,
+                    peers.len()
+                );
+                None
+            }
+        });
+        match client {
+            Some(ip) => keep.push((ip, port)),
+            None => s.closed.push(lv.name.clone()),
+        }
+        record.push((lv, port, client));
+    }
+    if let Err(e) = fence_install(&keep) {
+        error!("re-export: cannot install the nvmet fence: {e}; nothing re-exported");
+        s.retry = true;
+        return s;
+    }
+    for (lv, port, client) in record {
+        if let Err(e) = record_export(&lv.name, &lv.tags, port, client) {
+            warn!(
+                "re-export: could not record port {port} on {}: {e}",
+                lv.name
+            );
+        }
+        s.already += 1;
+    }
+
     for lv in &lvs {
         let id = &lv.name;
         if has_tag(&lv.tags, TAG_SEALED) {
@@ -838,21 +900,18 @@ fn reexport_locked() -> ReexportSummary {
             }
             continue;
         }
-        if let Some(p) = existing_export(id) {
-            if let Ok(p) = p.parse::<u16>() {
-                if let Err(e) = set_port_tag(id, &lv.tags, p) {
-                    warn!("re-export: could not record port {p} on {id}: {e}");
-                }
-            }
-            s.already += 1;
-            continue;
+        if existing_export(id).is_some() {
+            continue; // counted above
         }
         match reexport_one(lv, &used, min, max) {
-            Ok((port, moved)) => {
+            Ok((port, moved, client)) => {
                 used.insert(port);
                 s.exported += 1;
                 if moved {
                     s.moved += 1;
+                }
+                if client.is_none() {
+                    s.closed.push(id.clone());
                 }
             }
             Err(e) => {
@@ -865,18 +924,36 @@ fn reexport_locked() -> ReexportSummary {
         }
     }
     info!(
-        "re-export: exported={} already={} failed={} moved={}",
+        "re-export: exported={} already={} failed={} moved={} closed={}",
         s.exported,
         s.already,
         s.failed.len(),
-        s.moved
+        s.moved,
+        s.closed.len()
     );
     s
 }
 
+/// The /utilization warning for a pass that left ports closed.
+fn reexport_warning(s: &ReexportSummary) -> Option<String> {
+    (!s.closed.is_empty()).then(|| {
+        format!(
+            "{} volume(s) exported with no client; closed until attached again",
+            s.closed.len()
+        )
+    })
+}
+
 /// Activate (if needed) and export one volume, preferring its recorded
-/// port. Ok((port, moved)).
-fn reexport_one(lv: &Lv, used: &BTreeSet<u16>, min: u16, max: u16) -> Result<(u16, bool)> {
+/// port, then open the port to its recorded client (or the one peer on
+/// it; none for a fresh export, so a 0.4.0 volume without a connection
+/// comes back closed). Ok((port, moved, client)).
+fn reexport_one(
+    lv: &Lv,
+    used: &BTreeSet<u16>,
+    min: u16,
+    max: u16,
+) -> Result<(u16, bool, Option<Ipv4Addr>)> {
     let id = &lv.name;
     if !lv.active {
         info!("re-export: activating {id}");
@@ -912,8 +989,20 @@ fn reexport_one(lv: &Lv, used: &BTreeSet<u16>, min: u16, max: u16) -> Result<(u1
         }
     };
     export(id, want)?;
-    set_port_tag(id, &lv.tags, want)?;
-    Ok((want, old.is_some_and(|o| o != want)))
+    let client = match refence(lv, want) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("re-export of {id}: cannot fence {want}: {e}; unexporting");
+            if let Err(e2) = remove_export(id) {
+                warn!("cleanup of {id} failed too: {e2}");
+            }
+            return Err(e);
+        }
+    };
+    if client.is_none() {
+        set_port_tag(id, &lv.tags, want)?;
+    }
+    Ok((want, old.is_some_and(|o| o != want), client))
 }
 
 /// GET /reexport: run the startup pass again and report what it did.
@@ -997,6 +1086,9 @@ const TAG_NAME: &str = "abe_name";
 const TAG_BASE: &str = "abe_base";
 /// `abe_sealed`: a base that is filled and frozen: never exported, clone-only.
 const TAG_SEALED: &str = "abe_sealed";
+/// `abe_client=<ipv4>`: the address the port is fenced to (the caller of
+/// the last /configure, /id or /clone); re-export opens it to the same.
+const TAG_CLIENT: &str = "abe_client";
 
 /// Value of the `key=value` tag, if present.
 fn tag_value<'a>(tags: &'a [String], key: &str) -> Option<&'a str> {
@@ -1039,16 +1131,57 @@ fn retag(id: &str, del: &[String], add: &[String]) -> Result<()> {
 
 /// Record the port `id` is exported on, replacing any earlier record.
 fn set_port_tag(id: &str, tags: &[String], port: u16) -> Result<()> {
-    let new = format!("{TAG_PORT}={port}");
-    let old: Vec<String> = tags
-        .iter()
-        .filter(|t| t.starts_with("abe_port=") && **t != new)
-        .cloned()
-        .collect();
-    if old.is_empty() && tags.contains(&new) {
-        return Ok(());
+    record_export(id, tags, port, None)
+}
+
+/// Record the port `id` is exported on and (when known) the client its
+/// port is open to, replacing earlier records of either, in one lvchange.
+/// `client: None` leaves any `abe_client` tag alone.
+fn record_export(id: &str, tags: &[String], port: u16, client: Option<Ipv4Addr>) -> Result<()> {
+    let mut add = vec![format!("{TAG_PORT}={port}")];
+    if let Some(ip) = client {
+        add.push(format!("{TAG_CLIENT}={ip}"));
     }
-    retag(id, &old, &[new])
+    let mut del = Vec::new();
+    for t in tags {
+        let stale =
+            t.starts_with("abe_port=") || (client.is_some() && t.starts_with("abe_client="));
+        if stale && !add.contains(t) {
+            del.push(t.clone());
+        }
+    }
+    add.retain(|t| !tags.contains(t));
+    retag(id, &del, &add)
+}
+
+/// Under OPS: open `port` to the volume's recorded client, or adopt the
+/// one peer connected to it (an export made before the fence existed) and
+/// record that. Ok(None): nobody to open it to; the port stays closed.
+fn refence(lv: &Lv, port: u16) -> Result<Option<Ipv4Addr>> {
+    let id = &lv.name;
+    let tagged = tag_value(&lv.tags, TAG_CLIENT).and_then(|v| v.parse::<Ipv4Addr>().ok());
+    let client = match tagged {
+        Some(ip) => ip,
+        None => {
+            let peers = established_peers(port);
+            if peers.len() != 1 {
+                info!(
+                    "{id} on {port}: no client recorded and {} connected; closed until attached again",
+                    peers.len()
+                );
+                fence_close_port(port)?;
+                return Ok(None);
+            }
+            let ip = *peers.iter().next().unwrap();
+            info!("adopted {ip} for {id} on {port}");
+            ip
+        }
+    };
+    fence_open(client, port)?;
+    if let Err(e) = record_export(id, &lv.tags, port, Some(client)) {
+        warn!("could not record {client} on {id}: {e}");
+    }
+    Ok(Some(client))
 }
 
 /// The abe volume carrying exactly this tag, if any.
@@ -1269,7 +1402,7 @@ async fn seal(EP(id): EP<String>) -> std::result::Result<Json<SealReply>, ApiErr
             let del: Vec<String> = lv
                 .tags
                 .iter()
-                .filter(|t| t.starts_with("abe_port="))
+                .filter(|t| t.starts_with("abe_port=") || t.starts_with("abe_client="))
                 .cloned()
                 .collect();
             let add: Vec<String> = (!has_tag(&lv.tags, TAG_SEALED))
@@ -1604,6 +1737,7 @@ fn remove_volume(id: &str) -> Res<Message> {
         existing: false,
         base: None,
         sealed: None,
+        client: None,
     })
 }
 
@@ -1619,6 +1753,9 @@ async fn utilization() -> std::result::Result<Json<Utilization>, ApiError> {
     let mut u = summarize(&vg_name(), thin_pool().as_deref(), &lvs, vg_bytes, vg_free)
         .map_err(|e| api_err("utilization", e))?;
     u.reexport = last_reexport();
+    if let Some(w) = u.reexport.as_ref().and_then(reexport_warning) {
+        u.warnings.push(w);
+    }
     Ok(Json(u))
 }
 
@@ -1964,16 +2101,31 @@ fn summarize(
     Ok(u)
 }
 
+/// `client` is what the fence allows right now; if nft cannot be asked
+/// (no table yet) the recorded `abe_client` tag stands in.
 fn list_volumes() -> Result<Vec<Volume>> {
     let lvs = list_lvs()?;
     let traddr = advertised_traddr();
+    let fence = match fence_list() {
+        Ok(f) => Some(f),
+        Err(e) => {
+            warn!("cannot list the fence: {e}");
+            None
+        }
+    };
     let mut vols = Vec::new();
     for l in lvs.iter().filter(|l| is_volume_id(&l.name)) {
         let n = layers(&lvs, &l.name);
+        let port = existing_export(&l.name);
+        let client = match (&fence, port.as_deref().and_then(|p| p.parse::<u16>().ok())) {
+            (_, None) => None,
+            (Some(f), Some(p)) => f.get(&p).map(|ip| ip.to_string()),
+            (None, Some(_)) => tag_value(&l.tags, TAG_CLIENT).map(str::to_string),
+        };
         vols.push(Volume {
             id: l.name.clone(),
             bytes: l.bytes,
-            port: existing_export(&l.name),
+            port,
             traddr: traddr.clone(),
             nqn: l.name.clone(),
             used_bytes: if l.segtype == "thin" {
@@ -1988,6 +2140,7 @@ fn list_volumes() -> Result<Vec<Volume>> {
             base: tag_value(&l.tags, TAG_BASE).map(str::to_string),
             sealed: has_tag(&l.tags, TAG_SEALED),
             name: tag_value(&l.tags, TAG_NAME).map(str::to_string),
+            client,
         });
     }
     Ok(vols)
@@ -2022,8 +2175,9 @@ fn remove_holders(lv: &str) -> Result<()> {
     Ok(())
 }
 
-/// Tear down the nvmet port + subsystem for `id`. Returns the trsvcid the
-/// volume was exported on, if any. Missing pieces are not errors.
+/// Tear down the nvmet port + subsystem for `id`, closing the fence for
+/// its port first. Returns the trsvcid the volume was exported on, if any.
+/// Missing pieces are not errors.
 fn remove_export(id: &str) -> Result<Option<String>> {
     let root = nvmet_path();
     let mut svc = None;
@@ -2036,6 +2190,13 @@ fn remove_export(id: &str) -> Result<Option<String>> {
             svc = fs::read_to_string(p.path().join("addr_trsvcid"))
                 .ok()
                 .map(|s| s.trim().to_string());
+            // Fence first: nobody reaches a port that is being torn down,
+            // and a stale element can never outlive its export.
+            if let Some(port) = svc.as_deref().and_then(|s| s.parse::<u16>().ok()) {
+                if let Err(e) = fence_close_port(port) {
+                    warn!("could not close {port} in the fence: {e}");
+                }
+            }
             info!("unlinking {}", link.display());
             fs::remove_file(&link)?;
             // Drop the port too if nothing else is exported through it.
@@ -2394,6 +2555,16 @@ async fn main() {
 
     warn_if_discards_ignored();
 
+    // The fence goes up before any port does, so no export is ever
+    // reachable from everywhere. The re-export pass refills it.
+    if let Err(e) = tokio::task::spawn_blocking(|| fence_install(&[]))
+        .await
+        .unwrap_or_else(|e| Err(Error::other(e.to_string())))
+    {
+        error!("cannot install the nvmet fence (nft): {e}");
+        std::process::exit(4);
+    }
+
     // Everything exported before the restart comes back before the first
     // request can be served, so nobody sees a half-restored target.
     reexport_at_startup().await;
@@ -2409,12 +2580,14 @@ async fn main() {
         .route("/version", get(version));
 
     info!(
-        "vg={} thin_pool={:?} bind={} advertise={} nvmet={} ports={port_min}-{port_max}",
+        "vg={} thin_pool={:?} bind={} advertise={} nvmet={} ports={port_min}-{port_max} nft={} tls={}",
         vg_name(),
         thin_pool(),
         bind_traddr(),
         advertised_traddr(),
-        nvmet_path()
+        nvmet_path(),
+        nft_bin().display(),
+        tls_enabled()
     );
     serve(app).await;
 }
@@ -3259,5 +3432,53 @@ table inet abe {
         std::env::remove_var("ABE_NFT");
         let p = nft_bin();
         assert_eq!(p.file_name().and_then(|n| n.to_str()), Some("nft"));
+    }
+
+    #[test]
+    fn client_tag_round_trips() {
+        let ip: Ipv4Addr = "10.22.0.1".parse().unwrap();
+        let tag = format!("{TAG_CLIENT}={ip}");
+        assert_eq!(tag, "abe_client=10.22.0.1");
+        // what lvchange --addtag is given is what lvs gives back
+        assert!(valid_tag_value(&ip.to_string()));
+        let lvs = parse_lvs(&format!(
+            "  0123456789abcdef0123456789abcdef|1073741824|abe|||||thin|abe_port=44001,{tag}|active\n"
+        ));
+        assert_eq!(tag_value(&lvs[0].tags, TAG_CLIENT), Some("10.22.0.1"));
+        assert_eq!(
+            tag_value(&lvs[0].tags, TAG_CLIENT).and_then(|v| v.parse::<Ipv4Addr>().ok()),
+            Some(ip)
+        );
+        assert!(has_tag(&lvs[0].tags, TAG_CLIENT));
+    }
+
+    #[test]
+    fn reexport_summary_lists_closed_ports() {
+        let mut s = ReexportSummary::default();
+        assert_eq!(reexport_warning(&s), None);
+        s.closed = vec!["a".into(), "b".into()];
+        assert_eq!(
+            reexport_warning(&s).as_deref(),
+            Some("2 volume(s) exported with no client; closed until attached again")
+        );
+        let v: serde_json::Value = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["closed"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn volume_and_message_carry_the_client() {
+        let m = Message::exported("0123456789abcdef0123456789abcdef", "44001");
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert!(v.get("client").is_none());
+        let mut m = m;
+        m.client = Some("10.22.0.1".into());
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["client"], "10.22.0.1");
+        // an old reply without the field still parses
+        let old: Message = serde_json::from_str(
+            r#"{"message":"","id":"x","port":"44001","traddr":"10.22.0.1","nqn":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.client, None);
     }
 }
