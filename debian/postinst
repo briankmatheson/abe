@@ -19,21 +19,13 @@ EOF
         systemctl daemon-reload || true
         
         echo ""
-        echo "⚠️  WARNING: ABE installed without authentication!"
-        echo ""
-        echo "This version of ABE does NOT include authentication."
-        echo "See /usr/share/doc/abe/SECURITY_AUDIT.md for security issues."
-        echo ""
-        echo "Before starting ABE, ensure you have:"
-        echo "  1. Created the LVM volume group 'abe' (or set ABE_VG / ABE_THIN_POOL"
-        echo "     in /etc/default/abe to use an existing one)"
+        echo "Before starting ABE (systemctl start abe), make sure you have:"
+        echo "  1. an LVM volume group 'abe' (or ABE_VG / ABE_THIN_POOL in"
+        echo "     /etc/default/abe naming an existing one)"
         echo "     Example: pvcreate /dev/vdb && vgcreate abe /dev/vdb"
-        echo ""
-        echo "  2. Configured firewall to block external access"
-        echo "     Example: ufw allow from 10.0.0.0/8 to any port 80"
-        echo ""
-        echo "Then manually start if needed:"
-        echo "  systemctl start abe"
+        echo "  2. a server certificate, key and client CA at /etc/abe/{cert,key,ca}.pem"
+        echo "     (or ABE_TLS_CERT / ABE_TLS_KEY / ABE_TLS_CA in /etc/default/abe);"
+        echo "     see /usr/share/doc/abe/README.md, section TLS"
         echo ""
         ;;
         

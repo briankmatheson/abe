@@ -2,22 +2,21 @@
 
 ## 📦 Package Built
 
-**File:** `target/debian/abe-block-exporter_0.4.0-1_amd64.deb`  
+**File:** `target/debian/abe-block-exporter_0.5.0-1_amd64.deb`  
 **Package:** `abe-block-exporter` (the binary, unit and defaults keep the short name `abe`)  
-**Version:** 0.4.0-1
+**Version:** 0.5.0-1
 
-## ⚠️ Security Warning
+## Security
 
-**This package contains the INSECURE version of ABE without authentication!**
-
-- Use ONLY in isolated/trusted networks
-- See `SECURITY_AUDIT.md` for detailed security issues
-- Secure version (`main_secure_v1.rs.bak`) needs axum middleware fixes
+The API is HTTPS with mutual TLS (clients need a certificate signed by
+`ABE_TLS_CA`), and every nvmet port is fenced with nftables to the
+address that asked for it. See `README.md` (sections "TLS" and "Port
+fence") and `SECURITY_AUDIT.md`.
 
 ## Installation
 
 ```bash
-sudo dpkg -i target/debian/abe-block-exporter_0.4.0-1_amd64.deb
+sudo dpkg -i target/debian/abe-block-exporter_0.5.0-1_amd64.deb
 ```
 
 ## Setup
@@ -32,15 +31,15 @@ sudo vgcreate abe /dev/vdb
 
 Or use XDebbie VM with `dataDiskGib` set.
 
-### 2. Configure Firewall (IMPORTANT!)
+### 2. Certificates
 
-```bash
-# Allow only from internal network
-sudo ufw allow from 10.0.0.0/8 to any port 80
-
-# Or use specific port range for NVMe-oF
-sudo ufw allow 4000:5000/tcp
-```
+Put the server certificate, its key and the client CA at
+`/etc/abe/{cert,key,ca}.pem` (or set `ABE_TLS_CERT` / `ABE_TLS_KEY` /
+`ABE_TLS_CA` in `/etc/default/abe`). `README.md`, section "TLS", has the
+openssl commands for a standalone CA. If the host firewall filters
+input, let 443 and the nvmet range 44001:44999 through on the interface
+initiators use; abe's own table (`inet abe`) narrows each port to the
+client that asked for it.
 
 ### 3. Start ABE
 
@@ -54,23 +53,27 @@ sudo systemctl status abe
 ### Create Volume
 
 ```bash
-# Configure creates 10GB volume
-curl http://abe-server/configure
+# Configure creates a 10G volume (see README.md for ?bytes=, ?name=, ...)
+CURL="curl --cacert ca.pem --cert client.pem --key client-key.pem"
+$CURL https://abe-server/configure
 ```
 
-Response:
+Response (abridged):
 ```json
 {
-  "message": "sudo nvme discover -a 10.23.0.100 -t tcp -s 4001 ; sudo nvme connect -a 10.23.0.100 -t tcp -s 4001 -n 550e8400e29b41d4a716446655440000",
+  "message": "sudo nvme connect -a 10.23.0.100 -t tcp -s 44001 -n 550e8400e29b41d4a716446655440000",
   "id": "550e8400e29b41d4a716446655440000",
-  "port": "4001"
+  "port": "44001",
+  "client": "10.23.0.7"
 }
 ```
+
+The port is open only to `client`, the address the request came from.
 
 ### Attach Existing Volume
 
 ```bash
-curl http://abe-server/id/{uuid}
+$CURL https://abe-server/id/{uuid}
 ```
 
 ## Integration with XDebbie
@@ -104,8 +107,8 @@ runcmd:
   - vgcreate abe /dev/vdb
   
   # Install ABE
-  - wget https://path/to/abe-block-exporter_0.4.0-1_amd64.deb
-  - dpkg -i abe-block-exporter_0.4.0-1_amd64.deb
+  - wget https://path/to/abe-block-exporter_0.5.0-1_amd64.deb
+  - dpkg -i abe-block-exporter_0.5.0-1_amd64.deb
   
   # Start ABE
   - systemctl start abe
@@ -123,18 +126,6 @@ runcmd:
 ABE automatically loads:
 - `nvmet` - NVMe-oF target subsystem
 - `nvmet-tcp` - NVMe over TCP transport
-
-## TODO: Secure Version
-
-The secure version with authentication exists but needs axum 0.7 middleware fixes:
-
-1. Fix middleware signature for axum 0.7
-2. Add bearer token authentication
-3. Add proper REST API (POST/DELETE /volumes)
-4. Add volume tracking
-5. Add configuration file support
-
-See `src/main_secure_v1.rs.bak` for implementation.
 
 ## Uninstall
 

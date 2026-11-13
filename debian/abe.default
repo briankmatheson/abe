@@ -6,17 +6,32 @@
 # Thin pool inside ABE_VG. When set, volumes are thin LVs (lvcreate -V ... -T).
 #ABE_THIN_POOL=
 
-# Address nvmet listens on (default: 0.0.0.0, every interface). The API has
-# no authentication: on a multi-homed host bind this and ABE_LISTEN to one
-# private address (e.g. a WireGuard underlay) rather than 0.0.0.0.
+# Address nvmet listens on (default: 0.0.0.0, every interface). On a
+# multi-homed host bind this and ABE_LISTEN to one private address (e.g. a
+# WireGuard underlay) rather than 0.0.0.0.
 #ABE_TRADDR=0.0.0.0
 
 # Address handed to initiators in API replies. Set this when clients live on
 # other machines; 0.0.0.0 is meaningless to them.
 #ABE_ADVERTISE=
 
-# HTTP API listen address (default: 0.0.0.0:80).
-#ABE_LISTEN=0.0.0.0:80
+# API listen address (default: 0.0.0.0:443).
+#ABE_LISTEN=0.0.0.0:443
+
+# The API is served over mutual TLS: abe presents ABE_TLS_CERT/KEY and only
+# accepts clients whose certificate chains to ABE_TLS_CA. ABE_TLS=off serves
+# plain HTTP with no authentication (warned about at every start; for the
+# unprivileged test harness and experiments only). See README "TLS" for
+# making a CA and certificates with openssl.
+#ABE_TLS=on
+#ABE_TLS_CERT=/etc/abe/cert.pem
+#ABE_TLS_KEY=/etc/abe/key.pem
+#ABE_TLS_CA=/etc/abe/ca.pem
+
+# nft binary for the nvmet port fence (default: nft on PATH, else
+# /usr/sbin/nft). Every exported port is open only to the address that
+# asked for it (table inet abe).
+#ABE_NFT=/usr/sbin/nft
 
 # nvmet TCP port range for exports (defaults: 44001-44999). Each export takes
 # the lowest free port; /configure answers 503 when the range is full.

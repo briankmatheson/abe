@@ -37,16 +37,19 @@ maintainer = "Brian Matheson <brian@brianmatheson.com>"
 copyright = "2024, Brian Matheson <brian@brianmatheson.com>"
 section = "admin"
 priority = "optional"
-depends = "lvm2, parted, fio"
+depends = "lvm2, parted, fio, nftables"
 extended-description = """
-ABE (Abe Block Exporter) is an NVMe-oF block storage server.
-
-WARNING: No authentication. Use only in trusted networks.
+ABE (Abe Block Exporter) is an NVMe-oF block storage server: volumes from
+an LVM thin pool, exported over NVMe/TCP, driven by an HTTPS API with
+mutual TLS. Each export's port is fenced (nftables) to the address that
+asked for it.
 """
 assets = [
     ["target/release/abe", "usr/bin/", "755"],
     ["debian/abe.service", "usr/lib/systemd/system/", "644"],
     ["SECURITY_AUDIT.md", "usr/share/doc/abe/", "644"],
+    ["README.md", "usr/share/doc/abe/", "644"],
+    ["CHANGELOG.md", "usr/share/doc/abe/", "644"],
     ["debian/abe.default", "etc/default/abe", "644"],
 ]
 conf-files = ["/etc/default/abe"]

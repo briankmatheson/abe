@@ -20,6 +20,15 @@ DEB      := target/debian/abe-block-exporter_$(VERSION)-1_$(ARCH).deb
 HOSTS    ?=
 SSH_USER ?= $(USER)
 
+# GET /version on the box after an install, with the TLS settings from its
+# /etc/default/abe (same derivation as tests/e2e.sh; sudo reads the key).
+# VERIFY runs locally; REMOTE_VERIFY is the same inside an ssh "..." string.
+VERIFY := . /etc/default/abe 2>/dev/null; \
+  if [ x$${ABE_TLS:-on} = xoff ]; then CURL=curl; S=http; \
+  else CURL='sudo curl --cacert '$${ABE_TLS_CA:-/etc/abe/ca.pem}' --cert '$${ABE_TLS_CERT:-/etc/abe/cert.pem}' --key '$${ABE_TLS_KEY:-/etc/abe/key.pem}; S=https; fi; \
+  $$CURL -sf $$S://$$(echo $${ABE_LISTEN:-127.0.0.1:443} | sed s/0.0.0.0/127.0.0.1/)/version; echo
+REMOTE_VERIFY = $(subst $$,\$$,$(VERIFY))
+
 .DEFAULT_GOAL := build
 .PHONY: build release test lint fmt clippy e2e deb install deploy tag push clean version help
 
@@ -58,6 +67,7 @@ $(DEB): deb
 # that is installed. Remove it yourself (apt remove abe abe-data) first.
 install: $(DEB)
 	sudo apt install -y --reinstall ./$(DEB) && sudo systemctl restart abe
+	@$(VERIFY)
 
 # make deploy HOSTS="timesink gram"  (ssh as $(SSH_USER); sudo must work there)
 deploy: $(DEB)
@@ -65,7 +75,7 @@ deploy: $(DEB)
 	@for h in $(HOSTS); do \
 	  echo "== $$h"; \
 	  scp $(DEB) $(SSH_USER)@$$h:/tmp/ && \
-	  ssh -t $(SSH_USER)@$$h "sudo apt install -y --reinstall /tmp/$(notdir $(DEB)) && sudo systemctl restart abe && systemctl is-active abe; . /etc/default/abe 2>/dev/null; curl -sf http://\$${ABE_LISTEN:-127.0.0.1:80}/version; echo" || exit 1; \
+	  ssh -t $(SSH_USER)@$$h "sudo apt install -y --reinstall /tmp/$(notdir $(DEB)) && sudo systemctl restart abe && systemctl is-active abe; $(REMOTE_VERIFY)" || exit 1; \
 	done
 
 tag:

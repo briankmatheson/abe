@@ -42,7 +42,12 @@ Configuration is by environment (see `debian/abe.default`, installed as
 | `ABE_THIN_POOL` | unset | thin pool in `ABE_VG`; volumes become thin LVs (needed for clones and bases) |
 | `ABE_TRADDR` | `0.0.0.0` | address nvmet listens on |
 | `ABE_ADVERTISE` | `ABE_TRADDR` | address reported to initiators (`traddr` in replies) |
-| `ABE_LISTEN` | `0.0.0.0:80` | HTTP API address |
+| `ABE_LISTEN` | `0.0.0.0:443` | API address |
+| `ABE_TLS` | `on` | `off`: plain HTTP, no authentication (test harness only; warned about at every start) |
+| `ABE_TLS_CERT` | `/etc/abe/cert.pem` | server certificate (PEM, leaf first, chain optional) |
+| `ABE_TLS_KEY` | `/etc/abe/key.pem` | its private key (PKCS#8, RSA or EC PEM) |
+| `ABE_TLS_CA` | `/etc/abe/ca.pem` | CA bundle client certificates must chain to |
+| `ABE_NFT` | `nft` on PATH, else `/usr/sbin/nft` | nft binary for the port fence |
 | `ABE_VOL_SIZE` | `10G` | size of a volume made without `?size=`/`?bytes=` |
 | `ABE_PORT_MIN` | `44001` | lowest nvmet TCP port handed to exports |
 | `ABE_PORT_MAX` | `44999` | highest; abe refuses to start unless `1 <= min <= max <= 65535` |
@@ -52,6 +57,90 @@ Configuration is by environment (see `debian/abe.default`, installed as
 | `ABE_FIO_BS` | `4k` | fio block size |
 | `ABE_FIO_IODEPTH` | `1` | fio writes in flight |
 | `ABE_NVMET_PATH` | `/sys/kernel/config/nvmet` | nvmet configfs root (tests only) |
+
+TLS
+---
+
+The API is HTTPS with **mutual TLS**: abe presents `ABE_TLS_CERT` /
+`ABE_TLS_KEY`, and a client is let in only if its certificate chains to
+`ABE_TLS_CA`. There is no other authentication; a client without a
+valid certificate never reaches a handler (the handshake is refused),
+so holding a certificate signed by that CA *is* the right to create and
+destroy volumes. Any load error is fatal at startup and names the file.
+`ABE_TLS=off` serves plain HTTP for the unprivileged test harness and
+standalone experiments; abe warns about it at every start.
+
+On a cluster that already has a CA (xdebbie's `/etc/xdebbie/api-*.pem`,
+whose leaf certificates carry serverAuth + clientAuth), point the three
+variables at those files. Standalone, make a CA, a server certificate
+and a client certificate with openssl (10-year validity; the server SAN
+must match the address clients use):
+
+```
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 -subj /CN=abe-ca -addext basicConstraints=critical,CA:TRUE -keyout ca-key.pem -out ca.pem
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj /CN=abe -keyout key.pem -out server.csr
+printf 'extendedKeyUsage=serverAuth\nsubjectAltName=IP:10.22.1.1,DNS:abe.example' > server.ext && openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -days 3650 -extfile server.ext -out cert.pem
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj /CN=client -keyout client-key.pem -out client.csr
+printf 'extendedKeyUsage=clientAuth' > client.ext && openssl x509 -req -in client.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -days 3650 -extfile client.ext -out client.pem
+```
+
+Install `cert.pem`, `key.pem` (root-only) and `ca.pem` under `/etc/abe/`
+on the server; give `client.pem`, `client-key.pem` and `ca.pem` to the
+client. Then:
+
+```
+curl --cacert ca.pem --cert client.pem --key client-key.pem https://10.22.1.1/version
+```
+
+`tests/e2e.sh` is the model for scripting abe this way; `/version`
+answers `"tls": true` and lists `tls` among its features.
+
+Port fence
+----------
+
+NVMe/TCP in the kernel has no x.509 authentication (its TLS is PSK-only),
+so abe fences each export's port to **the address its API call came
+from**: the TLS peer of the `/configure`, `GET /id` or `/clone` that
+exported it, never a parameter. Reaching a volume therefore needs a
+certificate *and* that source address. abe owns one nftables table:
+
+```
+table inet abe {
+    set allowed {
+        type ipv4_addr . inet_service
+        comment "client ip . nvmet port opened by abe"
+    }
+    chain input {
+        type filter hook input priority filter - 10; policy accept;
+        tcp dport 44001-44999  ip saddr . tcp dport @allowed  accept
+        tcp dport 44001-44999  reject with tcp reset
+        meta nfproto ipv6  tcp dport 44001-44999  reject with tcp reset
+    }
+}
+```
+
+The range is `ABE_PORT_MIN-ABE_PORT_MAX`. The table goes up before
+anything is exported (startup fails with exit 4 if nft cannot install
+it) and is **replaced atomically** on every re-export pass, already
+holding every live export. An export is opened right after configfs is
+set up and torn down again if the fence cannot be opened; a delete
+closes the port before the export goes. `GET /id` on an exported volume
+moves its port to the caller, so a VM that moved to another host is
+reachable from there after its next attach. The client is recorded in
+the `abe_client` tag and shown as `client` in `/volumes` and in replies.
+
+A volume exported by an older abe has no `abe_client` tag. On the first
+re-export pass abe looks for an **established TCP connection** to its
+port (`/proc/net/tcp`); exactly one peer is *adopted* (fence opened to
+it, tag written, `adopted <ip> for <id> on <port>` logged). With none or
+several the port stays closed, the id is listed in `reexport.closed`
+and `/utilization.warnings` says `N volume(s) exported with no client;
+closed until attached again`; the next `GET /id/<id>` opens it. `nft
+list table inet abe` shows the fence; if anything has mangled it, `GET
+/reexport` rebuilds it from scratch. The fence is IPv4 only: a request
+from an IPv6 address (other than v4-mapped) is a 400, and IPv6 to the
+port range is rejected outright. abe does not touch any other firewall
+rule; open 443 and the port range on the interface initiators use.
 
 Ports
 -----
@@ -63,9 +152,11 @@ are named after the port number (`ports/44003`); ones made by older
 versions (`ports/1`, `ports/2`) keep working, since only `addr_trsvcid`
 is consulted. When the range is full, `/configure`, `/clone` and `/id`
 answer `503` with `{"error": "no free nvmet port in 44001-44999 (N
-exported)"}` and nothing is left behind. ABE does not touch the host
-firewall; open 80 and 44000:44999 on the interface initiators use, e.g.
-`ufw allow in on wg-flock proto tcp from 10.22.0.0/16 to any port 44000:44999`.
+exported)"}` and nothing is left behind. Each port is open only to the
+address that asked for it (see "Port fence"); beyond that abe does not
+touch the host firewall, so open 443 and 44001:44999 on the interface
+initiators use, e.g. `ufw allow in on wg-flock proto tcp from
+10.22.0.0/16 to any port 44001:44999`.
 
 Exports live only in configfs, so a reboot or a fresh `nvmet` module
 load erases them. **At startup abe exports every volume again**, before
@@ -90,6 +181,7 @@ metadata and survives reboots without a state file:
 | `abe_name=<name>` | the caller's name, for idempotent create (`?name=`) |
 | `abe_base=<image>` | this volume is the base for `<image>` |
 | `abe_sealed` | the base is filled and frozen: never exported, clone-only |
+| `abe_client=<ipv4>` | the address its port is fenced to (the last caller); re-export opens it to the same |
 
 `name` and `image` values must match `[A-Za-z0-9._+:-]{1,128}` (400
 otherwise).
@@ -106,11 +198,11 @@ API
 | `GET /seal/<id>` | freeze a filled base: unexport it, tag `abe_sealed`; idempotent; 400 if `<id>` is not a base; reply `{"id","base","sealed":true,"bytes"}` |
 | `GET /id/<id>` | (re-)export an existing volume; idempotent; 409 on a sealed base |
 | `DELETE /id/<id>` | unexport and remove the volume; idempotent; allowed on a base (its clones keep their data) |
-| `GET /volumes` | list every volume: `id`, `bytes`, `port` (if exported), `traddr`, `nqn`, `used_bytes`, `data_percent`, `origin`, `layers`, `warning`, `base`, `sealed`, `name` |
+| `GET /volumes` | list every volume: `id`, `bytes`, `port` (if exported), `traddr`, `nqn`, `used_bytes`, `data_percent`, `origin`, `layers`, `warning`, `base`, `sealed`, `name`, `client` (the address the fence opens its port to) |
 | `GET /clone/<id>` or `?bytes=N[&name=..]` | create a new volume as a thin snapshot of `<id>` (shares blocks until written; optionally grown to N bytes) and export it; needs `ABE_THIN_POOL`; a base must be sealed first (409); `name` works as for `/configure` |
 | `GET /utilization` | thin pool (or VG) `bytes`, `used_bytes`, `free_bytes`, `data_percent`, `metadata_percent`, `provisioned_bytes`, `vg_bytes`, `vg_free_bytes`, `volumes`, `max_layers`, `warnings`, `reexport` |
-| `GET /reexport` | run the startup re-export pass again; reply `{"exported","already","failed":[ids],"moved","at"}` |
-| `GET /version` | `{"version", "features": [..]}`; features are `reexport`, `ports`, `name`, `trim`, and with a thin pool `base` and `clone` |
+| `GET /reexport` | run the startup re-export pass again (rebuilds the fence); reply `{"exported","already","failed":[ids],"moved","closed":[ids],"at"}` |
+| `GET /version` | `{"version", "features": [..], "tls"}`; features are `reexport`, `ports`, `name`, `trim`, `tls`, `fence`, and with a thin pool `base` and `clone` |
 
 Every call that changes LVM or configfs runs under one process-wide
 lock, so concurrent creates get distinct ports and a failed create
@@ -139,7 +231,8 @@ API refusals protect them.
 fio check
 ---------
 
-Replies carry `id`, `port` (nvmet trsvcid), `traddr`, `nqn` (== id) and a
+Replies carry `id`, `port` (nvmet trsvcid), `traddr`, `nqn` (== id),
+`client` (the address the port is open to: the caller's) and a
 ready-to-run `nvme connect` line in `message`. `/configure` also runs
 fio on the new volume: random direct writes at `ABE_FIO_BS` (default 4k)
 with `ABE_FIO_IODEPTH` (default 1) in flight, for `ABE_FIO_RAMP` seconds
@@ -167,10 +260,14 @@ Tests
 -----
 
 `cargo test` covers the pure parts (port choice, fio region, lvs and tag
-parsing, validation). `sudo tests/e2e.sh` drives a running abe on a host
-with a thin pool through every scenario, including a stop / configfs
-wipe (`tests/nvmet-wipe.sh`) / start round trip. `tests/lint-links.sh`
-checks the repo links.
+parsing, validation, the nft script and JSON, `/proc/net/tcp` parsing,
+the TLS configuration and a TLS round trip against the test-only PKI in
+`tests/certs/`). `sudo tests/e2e.sh` drives a running abe on a host with
+a thin pool through every scenario (14: the volume lifecycle, a stop /
+configfs wipe (`tests/nvmet-wipe.sh`) / start round trip, TLS without a
+client certificate, the fence from a second local address, adoption
+across a restart, and rebuilding the fence), reading the TLS settings
+from `/etc/default/abe`. `tests/lint-links.sh` checks the repo links.
 
 Use the client under extra/ for an example of connecting to the server
 and exporting block devices from your favorite Linux client:
