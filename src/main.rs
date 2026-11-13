@@ -1,25 +1,24 @@
-use if_addrs::get_if_addrs;
-use nix::mount::{MsFlags, mount};
-use nix::unistd::symlinkat;
-use std::path::PathBuf;
-use std::fs::{self, File, write};
-use std::io::{Result, Write, Error, ErrorKind};
-use std::fmt::Display;
-use std::path::Path;
-use std::process::Command;
-use std::env::var;
-use std::str;
-use uuid::Uuid;
-use log::{error, info, warn};
 use axum::{
     extract::{Path as EP, Query},
     http::StatusCode,
     routing::get,
-    Json, Router
+    Json, Router,
 };
+use if_addrs::get_if_addrs;
+use log::{error, info, warn};
+use nix::mount::{mount, MsFlags};
+use nix::unistd::symlinkat;
 use serde::{Deserialize, Serialize};
+use std::env::var;
+use std::fmt::Display;
+use std::fs::{self, write, File};
+use std::io::{Error, ErrorKind, Result, Write};
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::str;
+use uuid::Uuid;
 //use env_inventory;
-
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
 const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
@@ -44,7 +43,10 @@ fn bind_traddr() -> String {
 /// bind address, which is useless when that is 0.0.0.0, so set it when
 /// clients are on another box.
 fn advertised_traddr() -> String {
-    var("ABE_ADVERTISE").ok().filter(|s| !s.is_empty()).unwrap_or_else(bind_traddr)
+    var("ABE_ADVERTISE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(bind_traddr)
 }
 
 /// HTTP listen address (ABE_LISTEN, default 0.0.0.0:80).
@@ -65,7 +67,11 @@ fn default_vol_size() -> String {
 
 /// Size of the LV called `id`, if it exists.
 fn lv_bytes(id: &str) -> Option<u64> {
-    list_lvs().ok()?.into_iter().find(|l| l.name == id).map(|l| l.bytes)
+    list_lvs()
+        .ok()?
+        .into_iter()
+        .find(|l| l.name == id)
+        .map(|l| l.bytes)
 }
 
 /// Convert a byte count (e.g. a CSI capacity) to an lvcreate -L size,
@@ -96,7 +102,10 @@ struct ErrorMessage {
 fn api_err<E: Display>(what: &str, e: E) -> ApiError {
     let msg = format!("{what}: {e}");
     warn!("{msg}");
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorMessage { error: msg }))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorMessage { error: msg }),
+    )
 }
 
 //env_inventory::register!(RUST_LOG = "info")
@@ -138,16 +147,29 @@ struct Perf {
 /// (ABE_FIO_RAMP, default 3), with what block size (ABE_FIO_BS, default
 /// 4k) and how many in flight (ABE_FIO_IODEPTH, default 1).
 fn fio_seconds() -> u64 {
-    var("ABE_FIO_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(5)
+    var("ABE_FIO_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5)
 }
 fn fio_bs() -> String {
-    var("ABE_FIO_BS").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "4k".to_string())
+    var("ABE_FIO_BS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "4k".to_string())
 }
 fn fio_ramp() -> u64 {
-    var("ABE_FIO_RAMP").ok().and_then(|s| s.parse().ok()).unwrap_or(3)
+    var("ABE_FIO_RAMP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
 }
 fn fio_iodepth() -> u32 {
-    var("ABE_FIO_IODEPTH").ok().and_then(|s| s.parse().ok()).filter(|&d| d > 0).unwrap_or(1)
+    var("ABE_FIO_IODEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&d| d > 0)
+        .unwrap_or(1)
 }
 
 /// One entry of GET /volumes.
@@ -236,7 +258,9 @@ struct Lv {
     segtype: String,
 }
 
-async fn configure(Query(p): Query<ConfigureParams>) -> std::result::Result<Json<Message>, ApiError> {
+async fn configure(
+    Query(p): Query<ConfigureParams>,
+) -> std::result::Result<Json<Message>, ApiError> {
     let size = match (p.bytes, p.size) {
         (Some(b), _) => bytes_to_lv_size(b),
         (None, Some(s)) if !s.is_empty() => s,
@@ -252,8 +276,14 @@ async fn configure(Query(p): Query<ConfigureParams>) -> std::result::Result<Json
     let bytes = m.bytes.unwrap_or(1 << 30);
     m.perf = match tokio::task::spawn_blocking(move || characterize(&dev, bytes)).await {
         Ok(Ok(p)) => p,
-        Ok(Err(e)) => { warn!("fio on {id}: {e}"); None }
-        Err(e) => { warn!("fio task on {id}: {e}"); None }
+        Ok(Err(e)) => {
+            warn!("fio on {id}: {e}");
+            None
+        }
+        Err(e) => {
+            warn!("fio task on {id}: {e}");
+            None
+        }
     };
     Ok(Json(m))
 }
@@ -272,17 +302,34 @@ fn characterize(dev: &str, bytes: u64) -> Result<Option<Perf>> {
     let region = bytes.min(1 << 30);
     info!("fio: {ramp}s warm-up then {secs}s of {bs} random writes, iodepth {iodepth}, on the first {region} bytes of {dev}");
     let out = Command::new("fio")
-        .args(["--name=abe", "--filename", dev, "--rw=randwrite", "--bs", &bs,
-               "--iodepth", &iodepth.to_string(), "--size", &region.to_string(),
-               "--direct=1", "--ioengine=libaio",
-               "--time_based", "--ramp_time", &ramp.to_string(), "--runtime", &secs.to_string(),
-               "--output-format=json"])
+        .args([
+            "--name=abe",
+            "--filename",
+            dev,
+            "--rw=randwrite",
+            "--bs",
+            &bs,
+            "--iodepth",
+            &iodepth.to_string(),
+            "--size",
+            &region.to_string(),
+            "--direct=1",
+            "--ioengine=libaio",
+            "--time_based",
+            "--ramp_time",
+            &ramp.to_string(),
+            "--runtime",
+            &secs.to_string(),
+            "--output-format=json",
+        ])
         .output()?;
     check(out.clone(), "fio")?;
     let perf = parse_fio(&String::from_utf8_lossy(&out.stdout), &bs, iodepth)
         .ok_or_else(|| Error::other("fio printed no write results"))?;
-    info!("fio on {dev}: {:.0} us mean latency, {:.0} IOPS, {:.1} MiB/s at bs={bs} iodepth={iodepth}",
-          perf.write_lat_us, perf.write_iops, perf.write_mib_s);
+    info!(
+        "fio on {dev}: {:.0} us mean latency, {:.0} IOPS, {:.1} MiB/s at bs={bs} iodepth={iodepth}",
+        perf.write_lat_us, perf.write_iops, perf.write_mib_s
+    );
     Ok(Some(perf))
 }
 
@@ -293,7 +340,11 @@ fn parse_fio(json: &str, bs: &str, iodepth: u32) -> Option<Perf> {
     let runtime_ms = w.get("runtime")?.as_f64()?;
     let bw_bytes = w.get("bw_bytes")?.as_f64()?;
     let iops = w.get("iops")?.as_f64()?;
-    let lat_ns = w.get("clat_ns").and_then(|c| c.get("mean")).and_then(|m| m.as_f64()).unwrap_or(0.0);
+    let lat_ns = w
+        .get("clat_ns")
+        .and_then(|c| c.get("mean"))
+        .and_then(|m| m.as_f64())
+        .unwrap_or(0.0);
     let round = |x: f64| (x * 100.0).round() / 100.0;
     Some(Perf {
         bs: bs.to_string(),
@@ -308,7 +359,12 @@ fn parse_fio(json: &str, bs: &str, iodepth: u32) -> Option<Perf> {
 async fn attach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiError> {
     info!("attach id is {}", id);
     if !Path::new(&lv_path_for_uuid(&id)).exists() {
-        return Err((StatusCode::NOT_FOUND, Json(ErrorMessage { error: format!("no volume {id}") })));
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorMessage {
+                error: format!("no volume {id}"),
+            }),
+        ));
     }
     do_attach(id).await
 }
@@ -320,14 +376,24 @@ async fn detach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiErr
     let lv = lv_path_for_uuid(&id);
     let exported = existing_export(&id).is_some();
     if !exported && !Path::new(&lv).exists() {
-        return Err((StatusCode::NOT_FOUND, Json(ErrorMessage { error: format!("no volume {id}") })));
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorMessage {
+                error: format!("no volume {id}"),
+            }),
+        ));
     }
     let port = remove_export(&id).map_err(|e| api_err("nvmet teardown", e))?;
     if Path::new(&lv).exists() {
         remove_holders(&lv).map_err(|e| api_err("remove partition mappings", e))?;
-        check(Command::new("/usr/sbin/lvremove").args(["-y", &lv]).output()
-                  .map_err(|e| api_err("lvremove", e))?, "lvremove")
-            .map_err(|e| api_err("lvremove", e))?;
+        check(
+            Command::new("/usr/sbin/lvremove")
+                .args(["-y", &lv])
+                .output()
+                .map_err(|e| api_err("lvremove", e))?,
+            "lvremove",
+        )
+        .map_err(|e| api_err("lvremove", e))?;
     }
     Ok(Json(Message {
         message: format!("deleted {id}"),
@@ -357,8 +423,10 @@ async fn utilization() -> std::result::Result<Json<Utilization>, ApiError> {
 /// GET /clone/<id>[?bytes=N]: create a new volume that starts out as a copy
 /// of <id> (a thin snapshot: it shares the origin's blocks until either side
 /// writes) and export it. The origin may be any thin volume in abe's pool.
-async fn clone_volume(EP(origin): EP<String>, Query(p): Query<CloneParams>)
-                      -> std::result::Result<Json<CloneReply>, ApiError> {
+async fn clone_volume(
+    EP(origin): EP<String>,
+    Query(p): Query<CloneParams>,
+) -> std::result::Result<Json<CloneReply>, ApiError> {
     info!("clone of {origin}");
     let bad = |code, error: String| (code, Json(ErrorMessage { error }));
     let lvs = list_lvs().map_err(|e| api_err("lvs", e))?;
@@ -366,14 +434,24 @@ async fn clone_volume(EP(origin): EP<String>, Query(p): Query<CloneParams>)
         return Err(bad(StatusCode::NOT_FOUND, format!("no volume {origin}")));
     };
     if src.segtype != "thin" || src.pool.is_none() || src.pool != thin_pool() {
-        return Err(bad(StatusCode::BAD_REQUEST, format!(
-            "{origin} is not a thin volume in abe's pool ({}/{}); only those can be cloned",
-            vg_name(), thin_pool().unwrap_or_else(|| "<ABE_THIN_POOL not set>".to_string()))));
+        return Err(bad(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{origin} is not a thin volume in abe's pool ({}/{}); only those can be cloned",
+                vg_name(),
+                thin_pool().unwrap_or_else(|| "<ABE_THIN_POOL not set>".to_string())
+            ),
+        ));
     }
     if let Some(b) = p.bytes {
         if b < src.bytes {
-            return Err(bad(StatusCode::BAD_REQUEST, format!(
-                "a clone cannot be smaller than its origin ({b} < {} bytes)", src.bytes)));
+            return Err(bad(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "a clone cannot be smaller than its origin ({b} < {} bytes)",
+                    src.bytes
+                ),
+            ));
         }
     }
     let grow_to = p.bytes.filter(|b| *b > src.bytes);
@@ -385,11 +463,18 @@ async fn clone_volume(EP(origin): EP<String>, Query(p): Query<CloneParams>)
         warn!("{w}");
     }
     clone_lv(&origin, &id, grow_to).map_err(|e| api_err("clone_lv", e))?;
-    let bytes = list_lvs().ok()
+    let bytes = list_lvs()
+        .ok()
         .and_then(|l| l.into_iter().find(|l| l.name == id).map(|l| l.bytes))
         .unwrap_or(grow_to.unwrap_or(src.bytes));
     let Json(export) = do_attach(id).await?;
-    Ok(Json(CloneReply { export, bytes, origin, layers, warning }))
+    Ok(Json(CloneReply {
+        export,
+        bytes,
+        origin,
+        layers,
+        warning,
+    }))
 }
 
 /// Thin snapshot of `origin` named `name`, activated, optionally grown to
@@ -398,21 +483,42 @@ fn clone_lv(origin: &str, name: &str, grow_to: Option<u64>) -> Result<()> {
     let vg = vg_name();
     let lv = format!("{vg}/{name}");
     info!("making thin snapshot {lv} of {vg}/{origin}");
-    check(Command::new("/usr/sbin/lvcreate")
-              .args(["-y", "-s", "-n", name, &format!("{vg}/{origin}")]).output()?, "lvcreate -s")?;
+    check(
+        Command::new("/usr/sbin/lvcreate")
+            .args(["-y", "-s", "-n", name, &format!("{vg}/{origin}")])
+            .output()?,
+        "lvcreate -s",
+    )?;
     // Thin snapshots are created with the activation-skip flag set; clear it
     // so the volume comes up now and after every reboot.
     let finish = || -> Result<()> {
-        check(Command::new("/usr/sbin/lvchange").args(["-y", "-kn", &lv]).output()?, "lvchange -kn")?;
-        check(Command::new("/usr/sbin/lvchange").args(["-y", "-ay", &lv]).output()?, "lvchange -ay")?;
+        check(
+            Command::new("/usr/sbin/lvchange")
+                .args(["-y", "-kn", &lv])
+                .output()?,
+            "lvchange -kn",
+        )?;
+        check(
+            Command::new("/usr/sbin/lvchange")
+                .args(["-y", "-ay", &lv])
+                .output()?,
+            "lvchange -ay",
+        )?;
         if let Some(b) = grow_to {
-            check(Command::new("/usr/sbin/lvextend")
-                      .args(["-y", "-L", &bytes_to_lv_size(b), &lv]).output()?, "lvextend")?;
+            check(
+                Command::new("/usr/sbin/lvextend")
+                    .args(["-y", "-L", &bytes_to_lv_size(b), &lv])
+                    .output()?,
+                "lvextend",
+            )?;
         }
         Ok(())
     };
     if let Err(e) = finish() {
-        match Command::new("/usr/sbin/lvremove").args(["-y", &lv]).output() {
+        match Command::new("/usr/sbin/lvremove")
+            .args(["-y", &lv])
+            .output()
+        {
             Ok(o) if o.status.success() => info!("removed half-made clone {lv}"),
             _ => warn!("could not remove half-made clone {lv}"),
         }
@@ -427,13 +533,24 @@ fn is_volume_id(name: &str) -> bool {
     name.len() == 32 && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-const LVS_FIELDS: &str = "lv_name,lv_size,pool_lv,origin,data_percent,metadata_percent,lv_metadata_size,segtype";
+const LVS_FIELDS: &str =
+    "lv_name,lv_size,pool_lv,origin,data_percent,metadata_percent,lv_metadata_size,segtype";
 
 /// Every LV in the VG.
 fn list_lvs() -> Result<Vec<Lv>> {
     let out = Command::new("/usr/sbin/lvs")
         .env("LC_ALL", "C")
-        .args(["--noheadings", "--units", "b", "--nosuffix", "--separator", "|", "-o", LVS_FIELDS, &vg_name()])
+        .args([
+            "--noheadings",
+            "--units",
+            "b",
+            "--nosuffix",
+            "--separator",
+            "|",
+            "-o",
+            LVS_FIELDS,
+            &vg_name(),
+        ])
         .output()?;
     check(out.clone(), "lvs")?;
     Ok(parse_lvs(&String::from_utf8_lossy(&out.stdout)))
@@ -468,15 +585,30 @@ fn parse_lvs(text: &str) -> Vec<Lv> {
 fn vg_space() -> Result<(u64, u64)> {
     let out = Command::new("/usr/sbin/vgs")
         .env("LC_ALL", "C")
-        .args(["--noheadings", "--units", "b", "--nosuffix", "--separator", "|", "-o", "vg_size,vg_free", &vg_name()])
+        .args([
+            "--noheadings",
+            "--units",
+            "b",
+            "--nosuffix",
+            "--separator",
+            "|",
+            "-o",
+            "vg_size,vg_free",
+            &vg_name(),
+        ])
         .output()?;
     check(out.clone(), "vgs")?;
     let text = String::from_utf8_lossy(&out.stdout);
-    parse_vgs(&text).ok_or_else(|| Error::other(format!("cannot parse vgs output {:?}", text.trim())))
+    parse_vgs(&text)
+        .ok_or_else(|| Error::other(format!("cannot parse vgs output {:?}", text.trim())))
 }
 
 fn parse_vgs(text: &str) -> Option<(u64, u64)> {
-    let mut f = text.lines().find(|l| !l.trim().is_empty())?.split('|').map(str::trim);
+    let mut f = text
+        .lines()
+        .find(|l| !l.trim().is_empty())?
+        .split('|')
+        .map(str::trim);
     Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
 }
 
@@ -488,8 +620,15 @@ fn layers(lvs: &[Lv], name: &str) -> u32 {
     let mut cur = name;
     // the bound only matters if the report were ever to contain a loop
     while (depth as usize) < lvs.len() {
-        match lvs.iter().find(|l| l.name == cur).and_then(|l| l.origin.as_deref()) {
-            Some(o) => { depth += 1; cur = o; }
+        match lvs
+            .iter()
+            .find(|l| l.name == cur)
+            .and_then(|l| l.origin.as_deref())
+        {
+            Some(o) => {
+                depth += 1;
+                cur = o;
+            }
             None => break,
         }
     }
@@ -497,8 +636,8 @@ fn layers(lvs: &[Lv], name: &str) -> u32 {
 }
 
 fn layer_warning(name: &str, layers: u32) -> Option<String> {
-    (layers > MAX_SNAPSHOT_LAYERS).then(|| format!(
-        "{name} has {layers} snapshot layers (more than {MAX_SNAPSHOT_LAYERS})"))
+    (layers > MAX_SNAPSHOT_LAYERS)
+        .then(|| format!("{name} has {layers} snapshot layers (more than {MAX_SNAPSHOT_LAYERS})"))
 }
 
 /// `pct` percent of `bytes`. lvs reports percentages to two decimals, so
@@ -507,7 +646,13 @@ fn percent_of(bytes: u64, pct: f64) -> u64 {
     ((bytes as f64) * pct / 100.0).round() as u64
 }
 
-fn summarize(vg: &str, pool: Option<&str>, lvs: &[Lv], vg_bytes: u64, vg_free: u64) -> Result<Utilization> {
+fn summarize(
+    vg: &str,
+    pool: Option<&str>,
+    lvs: &[Lv],
+    vg_bytes: u64,
+    vg_free: u64,
+) -> Result<Utilization> {
     let mut max_layers = 0;
     let mut warnings = Vec::new();
     for l in lvs {
@@ -533,19 +678,26 @@ fn summarize(vg: &str, pool: Option<&str>, lvs: &[Lv], vg_bytes: u64, vg_free: u
         warnings,
     };
     if let Some(pool) = pool {
-        let p = lvs.iter().find(|l| l.name == pool && l.segtype == "thin-pool")
+        let p = lvs
+            .iter()
+            .find(|l| l.name == pool && l.segtype == "thin-pool")
             .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no thin pool {vg}/{pool}")))?;
-        let pct = p.data_percent
-            .ok_or_else(|| Error::other(format!("thin pool {vg}/{pool} reports no usage (inactive?)")))?;
+        let pct = p.data_percent.ok_or_else(|| {
+            Error::other(format!(
+                "thin pool {vg}/{pool} reports no usage (inactive?)"
+            ))
+        })?;
         u.bytes = p.bytes;
         u.used_bytes = percent_of(p.bytes, pct).min(p.bytes);
         u.free_bytes = p.bytes - u.used_bytes;
         u.data_percent = pct;
         u.metadata_percent = p.metadata_percent;
         u.metadata_bytes = p.metadata_bytes;
-        u.provisioned_bytes = lvs.iter()
+        u.provisioned_bytes = lvs
+            .iter()
             .filter(|l| l.segtype == "thin" && l.pool.as_deref() == Some(pool))
-            .map(|l| l.bytes).sum();
+            .map(|l| l.bytes)
+            .sum();
     } else if u.bytes > 0 {
         u.data_percent = ((u.used_bytes as f64) * 10000.0 / (u.bytes as f64)).round() / 100.0;
     }
@@ -583,15 +735,26 @@ fn list_volumes() -> Result<Vec<Volume>> {
 /// "used by another device". Remove any such holders.
 fn remove_holders(lv: &str) -> Result<()> {
     let dm = fs::canonicalize(lv)?;
-    let dm = dm.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+    let dm = dm
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
     let holders = match fs::read_dir(format!("/sys/block/{dm}/holders")) {
         Ok(h) => h,
         Err(_) => return Ok(()),
     };
     for h in holders.flatten() {
-        let name = fs::read_to_string(h.path().join("dm/name"))?.trim().to_string();
+        let name = fs::read_to_string(h.path().join("dm/name"))?
+            .trim()
+            .to_string();
         info!("removing holder {name}");
-        check(Command::new("/usr/sbin/dmsetup").args(["remove", "--retry", &name]).output()?, "dmsetup remove")?;
+        check(
+            Command::new("/usr/sbin/dmsetup")
+                .args(["remove", "--retry", &name])
+                .output()?,
+            "dmsetup remove",
+        )?;
     }
     Ok(())
 }
@@ -606,11 +769,15 @@ fn remove_export(id: &str) -> Result<Option<String>> {
             if !link.exists() {
                 continue;
             }
-            svc = fs::read_to_string(p.path().join("addr_trsvcid")).ok().map(|s| s.trim().to_string());
+            svc = fs::read_to_string(p.path().join("addr_trsvcid"))
+                .ok()
+                .map(|s| s.trim().to_string());
             info!("unlinking {}", link.display());
             fs::remove_file(&link)?;
             // Drop the port too if nothing else is exported through it.
-            let empty = fs::read_dir(p.path().join("subsystems")).map(|mut d| d.next().is_none()).unwrap_or(false);
+            let empty = fs::read_dir(p.path().join("subsystems"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false);
             if empty {
                 info!("removing port {}", p.path().display());
                 fs::remove_dir(p.path())?;
@@ -677,26 +844,30 @@ async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
     info!("allocating port {i}");
 
     let lv_path = lv_path_for_uuid(&id);
-    
-    let target = Subsystem::create(&id).await.map_err(|e| api_err("nvmet subsystem", e))?;
-    target.add_namespace("1", &lv_path).await.map_err(|e| api_err("nvmet namespace", e))?;
+
+    let target = Subsystem::create(&id)
+        .await
+        .map_err(|e| api_err("nvmet subsystem", e))?;
+    target
+        .add_namespace("1", &lv_path)
+        .await
+        .map_err(|e| api_err("nvmet namespace", e))?;
 
     let svc_port = format!("44{:03}", i);
     info!("svc_port is {svc_port}");
-	
 
-    let port  = Port::create(id.clone(), &svc_port, "tcp", i).map_err(|e| api_err("nvmet port", e))?;
-    port.link_subsystem(&target).map_err(|e| api_err("nvmet port link", e))?;
-	
+    let port =
+        Port::create(id.clone(), &svc_port, "tcp", i).map_err(|e| api_err("nvmet port", e))?;
+    port.link_subsystem(&target)
+        .map_err(|e| api_err("nvmet port link", e))?;
+
     println!("{} {}:{}", port.id, port.traddr, port.trsvcid);
-    
+
     Ok(Json(Message {
-        message: format!("sudo nvme discover -a {} -t tcp -s {} ; sudo nvme connect -a {} -t tcp -s {} -n {}",
-			 traddr,
-			 port.trsvcid,
-			 traddr,
-			 port.trsvcid,
-			 id),
+        message: format!(
+            "sudo nvme discover -a {} -t tcp -s {} ; sudo nvme connect -a {} -t tcp -s {} -n {}",
+            traddr, port.trsvcid, traddr, port.trsvcid, id
+        ),
         nqn: id.clone(),
         bytes: lv_bytes(&id),
         id,
@@ -728,7 +899,7 @@ impl Subsystem {
             "{}/subsystems/{}/namespaces/{}",
             NVMET_PATH, self.name, nsid
         );
-        info!("making namespace {ns_path}");     
+        info!("making namespace {ns_path}");
         fs::create_dir_all(&ns_path)?;
 
         info!("adding device {device_path}");
@@ -742,7 +913,6 @@ impl Subsystem {
             File::create(format!("{}/device_uuid", ns_path))?.write_all(u.as_bytes())?;
         }
 
-        
         info!("enabling {ns_path}/enable");
         File::create(format!("{}/enable", ns_path))?.write_all(b"1")?;
         Ok(())
@@ -754,36 +924,36 @@ struct Port {
     id: String,
     traddr: String,
     trsvcid: String,
-    iteration: u32
+    iteration: u32,
 }
 impl Port {
-    fn create(id: String, svcid: &str, trtype: &str, iteration: u32) -> Result<Port> {    
+    fn create(id: String, svcid: &str, trtype: &str, iteration: u32) -> Result<Port> {
         let path = format!("{}/ports/{}", NVMET_PATH, iteration);
         info!("making port {path}");
         // nvmet-tcp accepts 0.0.0.0 to listen on every interface; override
         // with ABE_TRADDR to pin a specific one.
         let traddr: String = bind_traddr();
-	let trsvcid: String = svcid.to_string();
+        let trsvcid: String = svcid.to_string();
         fs::create_dir_all(&path)?;
         info!("writing addr_traddr {path}");
         File::create(format!("{}/addr_traddr", path))?.write_all(traddr.as_bytes())?;
-	    
+
         info!("writing addr_trsvcid{path}");
         File::create(format!("{}/addr_trsvcid", path))?.write_all(trsvcid.as_bytes())?;
-	    
+
         info!("making addr_trtype {path}");
         File::create(format!("{}/addr_trtype", path))?.write_all(trtype.as_bytes())?;
-	    
+
         info!("making addr_adrfam {path}");
         File::create(format!("{}/addr_adrfam", path))?.write_all("ipv4".as_bytes())?;
-        Ok(Port{
-	    id, 
-	    traddr, 
-	    trsvcid, 
-	    iteration
-	})
+        Ok(Port {
+            id,
+            traddr,
+            trsvcid,
+            iteration,
+        })
     }
-    
+
     fn link_subsystem(&self, subsystem: &Subsystem) -> Result<()> {
         let subsys_path: String = format!("{}/subsystems/{}", NVMET_PATH, subsystem.name);
         let port_subsys_link: String = format!(
@@ -795,12 +965,11 @@ impl Port {
 
         Ok(())
     }
-
 }
 
 fn ensure_configfs_mounted() -> Result<()> {
     //fixme this doens't work
-    
+
     info!("Mounting configfs...");
     if !Path::new(CONFIGFS_PATH).exists() {
         mount::<str, str, str, str>(
@@ -815,12 +984,12 @@ fn ensure_configfs_mounted() -> Result<()> {
     Ok(())
 }
 
-fn lv_path_for_uuid(uuid: &str) ->  String {
+fn lv_path_for_uuid(uuid: &str) -> String {
     format!("/dev/{}/{uuid}", vg_name())
 }
 
 fn ensure_nvmet_present() -> Result<()> {
-    info!("making nvmet subsystem");        
+    info!("making nvmet subsystem");
     if !Path::new(NVMET_PATH).exists() {
         Command::new("modprobe")
             .args(["nvmet"])
@@ -828,7 +997,7 @@ fn ensure_nvmet_present() -> Result<()> {
             .expect("modprobe failed");
     }
     Ok(())
-}   
+}
 
 pub fn create_lv(name: &str, size: &str, raw: bool) -> Result<()> {
     let vg = vg_name();
@@ -836,7 +1005,17 @@ pub fn create_lv(name: &str, size: &str, raw: bool) -> Result<()> {
         Some(pool) => {
             info!("making thin lv {name} in {vg}/{pool}");
             Command::new("/usr/sbin/lvcreate")
-                .args(["-y", "-W", "y", "-V", size, "-T", &format!("{vg}/{pool}"), "-n", name])
+                .args([
+                    "-y",
+                    "-W",
+                    "y",
+                    "-V",
+                    size,
+                    "-T",
+                    &format!("{vg}/{pool}"),
+                    "-n",
+                    name,
+                ])
                 .output()?
         }
         None => {
@@ -857,9 +1036,24 @@ pub fn create_lv(name: &str, size: &str, raw: bool) -> Result<()> {
     // it by PARTLABEL. The partition is left blank: the client decides on
     // encryption and filesystem.
     info!("partitioning {dev}");
-    check(Command::new("/usr/sbin/parted").args(["-s", &dev, "mklabel", "gpt"]).output()?, "parted mklabel")?;
-    check(Command::new("/usr/sbin/parted").args(["-s", &dev, "mkpart", "primary", "1MiB", "100%"]).output()?, "parted mkpart")?;
-    check(Command::new("/usr/sbin/parted").args(["-s", &dev, "name", "1", name]).output()?, "parted name")?;
+    check(
+        Command::new("/usr/sbin/parted")
+            .args(["-s", &dev, "mklabel", "gpt"])
+            .output()?,
+        "parted mklabel",
+    )?;
+    check(
+        Command::new("/usr/sbin/parted")
+            .args(["-s", &dev, "mkpart", "primary", "1MiB", "100%"])
+            .output()?,
+        "parted mkpart",
+    )?;
+    check(
+        Command::new("/usr/sbin/parted")
+            .args(["-s", &dev, "name", "1", name])
+            .output()?,
+        "parted name",
+    )?;
     info!("created {dev} ({size})");
     Ok(())
 }
@@ -871,13 +1065,12 @@ fn check(output: std::process::Output, what: &str) -> Result<()> {
     let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
     warn!("{what} failed: {err}");
     Err(Error::other(format!("{what} failed: {err}")))
-}    
-
+}
 
 #[tokio::main]
 async fn main() {
     env_logger::init();
-    
+
     if let Err(e) = ensure_configfs_mounted().and_then(|_| ensure_nvmet_present()) {
         error!("cannot set up nvmet: {e}");
         std::process::exit(1);
@@ -890,14 +1083,20 @@ async fn main() {
         .route("/volumes", get(volumes))
         .route("/utilization", get(utilization));
 
-    info!("vg={} thin_pool={:?} bind={} advertise={}", vg_name(), thin_pool(), bind_traddr(), advertised_traddr());
+    info!(
+        "vg={} thin_pool={:?} bind={} advertise={}",
+        vg_name(),
+        thin_pool(),
+        bind_traddr(),
+        advertised_traddr()
+    );
     let listener = tokio::net::TcpListener::bind(listen_addr()).await.unwrap();
     if let Ok(addrs) = get_if_addrs() {
         for iface in addrs {
             if iface.ip().is_ipv4() && !iface.is_loopback() {
-		println!("Listening on http://{}", iface.ip());
-	    }
-	}
+                println!("Listening on http://{}", iface.ip());
+            }
+        }
     }
     axum::serve(listener, app).await.unwrap();
 }
@@ -944,10 +1143,19 @@ mod tests {
     fn parses_lvs() {
         let lvs = parse_lvs(LVS);
         assert_eq!(lvs.len(), 6);
-        assert_eq!(lvs[0], Lv {
-            name: "root".into(), bytes: 99996401664, pool: None, origin: None, data_percent: None,
-            metadata_percent: None, metadata_bytes: None, segtype: "linear".into(),
-        });
+        assert_eq!(
+            lvs[0],
+            Lv {
+                name: "root".into(),
+                bytes: 99996401664,
+                pool: None,
+                origin: None,
+                data_percent: None,
+                metadata_percent: None,
+                metadata_bytes: None,
+                segtype: "linear".into(),
+            }
+        );
         assert_eq!(lvs[1].segtype, "thin-pool");
         assert_eq!(lvs[1].data_percent, Some(12.34));
         assert_eq!(lvs[1].metadata_percent, Some(10.5));
@@ -966,7 +1174,10 @@ mod tests {
 
     #[test]
     fn parses_vgs() {
-        assert_eq!(parse_vgs("  1999307276288|599785537536\n"), Some((1999307276288, 599785537536)));
+        assert_eq!(
+            parse_vgs("  1999307276288|599785537536\n"),
+            Some((1999307276288, 599785537536))
+        );
         assert_eq!(parse_vgs(""), None);
         assert_eq!(parse_vgs("  1.82t|558g\n"), None);
     }
@@ -995,8 +1206,10 @@ mod tests {
         assert_eq!(layers(&lvs, "v10"), 10);
         assert_eq!(layer_warning("v10", layers(&lvs, "v10")), None);
         assert_eq!(layers(&lvs, "v11"), 11);
-        assert_eq!(layer_warning("v11", layers(&lvs, "v11")).as_deref(),
-                   Some("v11 has 11 snapshot layers (more than 10)"));
+        assert_eq!(
+            layer_warning("v11", layers(&lvs, "v11")).as_deref(),
+            Some("v11 has 11 snapshot layers (more than 10)")
+        );
     }
 
     #[test]
@@ -1010,7 +1223,14 @@ mod tests {
     #[test]
     fn summarizes_a_thin_pool() {
         let lvs = parse_lvs(LVS);
-        let u = summarize("timesink-vg", Some("abe"), &lvs, 1999307276288, 599785537536).unwrap();
+        let u = summarize(
+            "timesink-vg",
+            Some("abe"),
+            &lvs,
+            1999307276288,
+            599785537536,
+        )
+        .unwrap();
         assert_eq!(u.bytes, 1398887514112);
         assert_eq!(u.used_bytes, 172622719241); // 12.34 %
         assert_eq!(u.free_bytes, 1398887514112 - 172622719241);
@@ -1018,7 +1238,10 @@ mod tests {
         assert_eq!(u.metadata_percent, Some(10.5));
         assert_eq!(u.metadata_bytes, Some(2147483648));
         // base + two volumes + parked; not root, not the pool itself
-        assert_eq!(u.provisioned_bytes, 10737418240 + 2 * 42949672960 + 10737418240);
+        assert_eq!(
+            u.provisioned_bytes,
+            10737418240 + 2 * 42949672960 + 10737418240
+        );
         assert_eq!(u.vg_bytes, 1999307276288);
         assert_eq!(u.vg_free_bytes, 599785537536);
         assert_eq!(u.volumes, 2);
@@ -1030,7 +1253,10 @@ mod tests {
     fn summarizes_a_plain_vg() {
         let lvs = parse_lvs("  0123456789abcdef0123456789abcdef|1073741824||||||linear\n");
         let u = summarize("abe", None, &lvs, 4 << 30, 3 << 30).unwrap();
-        assert_eq!((u.bytes, u.used_bytes, u.free_bytes), (4 << 30, 1 << 30, 3 << 30));
+        assert_eq!(
+            (u.bytes, u.used_bytes, u.free_bytes),
+            (4 << 30, 1 << 30, 3 << 30)
+        );
         assert_eq!(u.data_percent, 25.0);
         assert_eq!(u.metadata_percent, None);
         assert_eq!(u.volumes, 1);
@@ -1039,13 +1265,21 @@ mod tests {
     #[test]
     fn summary_lists_deep_chains() {
         let mut lvs = chain(12);
-        lvs.push(Lv { name: "abe".into(), segtype: "thin-pool".into(), pool: None, ..thin("abe", None) });
+        lvs.push(Lv {
+            name: "abe".into(),
+            segtype: "thin-pool".into(),
+            pool: None,
+            ..thin("abe", None)
+        });
         let u = summarize("abe", Some("abe"), &lvs, 1 << 40, 0).unwrap();
         assert_eq!(u.max_layers, 12);
-        assert_eq!(u.warnings, vec![
-            "v11 has 11 snapshot layers (more than 10)".to_string(),
-            "v12 has 12 snapshot layers (more than 10)".to_string(),
-        ]);
+        assert_eq!(
+            u.warnings,
+            vec![
+                "v11 has 11 snapshot layers (more than 10)".to_string(),
+                "v12 has 12 snapshot layers (more than 10)".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1074,7 +1308,10 @@ mod tests {
     fn fio_without_results_is_none() {
         assert_eq!(parse_fio("", "4k", 1), None);
         assert_eq!(parse_fio(r#"{"jobs": []}"#, "4k", 1), None);
-        assert_eq!(parse_fio(r#"{"jobs": [{"read": {"bw_bytes": 1}}]}"#, "4k", 1), None);
+        assert_eq!(
+            parse_fio(r#"{"jobs": [{"read": {"bw_bytes": 1}}]}"#, "4k", 1),
+            None
+        );
     }
 
     #[test]
