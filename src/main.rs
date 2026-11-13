@@ -345,6 +345,228 @@ struct Utilization {
     max_layers: u32,
     /// one line per LV with more than MAX_SNAPSHOT_LAYERS snapshot layers
     warnings: Vec<String>,
+    /// what the last startup (or GET /reexport) pass did
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reexport: Option<ReexportSummary>,
+}
+
+/// What one re-export pass did (startup, GET /reexport, a retry).
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+struct ReexportSummary {
+    /// exported in this pass
+    exported: usize,
+    /// were already exported when the pass looked
+    already: usize,
+    /// could not be exported; the ids
+    failed: Vec<String>,
+    /// exported, but not on the port their abe_port tag named
+    moved: usize,
+    /// RFC 3339 time of the pass
+    at: String,
+    /// some failures were EADDRNOTAVAIL (the underlay address is not up
+    /// yet), so a prompt retry is worth it
+    #[serde(skip)]
+    retry: bool,
+}
+
+/// The last pass, for /utilization.
+static LAST_REEXPORT: Mutex<Option<ReexportSummary>> = Mutex::new(None);
+
+fn last_reexport() -> Option<ReexportSummary> {
+    LAST_REEXPORT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn remember_reexport(s: &ReexportSummary) {
+    *LAST_REEXPORT.lock().unwrap_or_else(|e| e.into_inner()) = Some(s.clone());
+}
+
+/// How long startup waits for every volume to be exported again before it
+/// starts serving anyway (ABE_REEXPORT_WAIT seconds, default 90). Only
+/// EADDRNOTAVAIL failures (the underlay address is not up yet) keep it
+/// waiting; the pass is retried every 2 s.
+fn reexport_wait() -> u64 {
+    var("ABE_REEXPORT_WAIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(90)
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Export every volume in the VG again, each on the port its `abe_port`
+/// tag names when that is free, so exports survive a reboot or a fresh
+/// nvmet module load (configfs is the only place they lived). Holds OPS
+/// for the whole pass. One LV failing does not stop the others.
+fn reexport_all() -> ReexportSummary {
+    let _g = OPS.lock().unwrap_or_else(|e| e.into_inner());
+    reexport_locked()
+}
+
+fn reexport_locked() -> ReexportSummary {
+    let mut s = ReexportSummary {
+        at: now_rfc3339(),
+        ..Default::default()
+    };
+    let mut lvs = match list_lvs() {
+        Ok(l) => l,
+        Err(e) => {
+            error!("re-export: lvs failed: {e}");
+            return s;
+        }
+    };
+    lvs.retain(|l| is_volume_id(&l.name));
+    lvs.sort_by(|a, b| a.name.cmp(&b.name));
+    let (min, max) = port_bounds();
+    let root = nvmet_path();
+    let mut used = used_ports(Path::new(&root));
+    for lv in &lvs {
+        let id = &lv.name;
+        if has_tag(&lv.tags, TAG_SEALED) {
+            // sealed bases are never exported
+            if existing_export(id).is_some() {
+                match remove_export(id) {
+                    Ok(_) => info!("re-export: unexported sealed base {id}"),
+                    Err(e) => warn!("re-export: could not unexport sealed base {id}: {e}"),
+                }
+            }
+            continue;
+        }
+        if let Some(p) = existing_export(id) {
+            if let Ok(p) = p.parse::<u16>() {
+                if let Err(e) = set_port_tag(id, &lv.tags, p) {
+                    warn!("re-export: could not record port {p} on {id}: {e}");
+                }
+            }
+            s.already += 1;
+            continue;
+        }
+        match reexport_one(lv, &used, min, max) {
+            Ok((port, moved)) => {
+                used.insert(port);
+                s.exported += 1;
+                if moved {
+                    s.moved += 1;
+                }
+            }
+            Err(e) => {
+                if e.raw_os_error() == Some(nix::libc::EADDRNOTAVAIL) {
+                    s.retry = true;
+                }
+                error!("re-export of {id} failed: {e}");
+                s.failed.push(id.clone());
+            }
+        }
+    }
+    info!(
+        "re-export: exported={} already={} failed={} moved={}",
+        s.exported,
+        s.already,
+        s.failed.len(),
+        s.moved
+    );
+    s
+}
+
+/// Activate (if needed) and export one volume, preferring its recorded
+/// port. Ok((port, moved)).
+fn reexport_one(lv: &Lv, used: &BTreeSet<u16>, min: u16, max: u16) -> Result<(u16, bool)> {
+    let id = &lv.name;
+    if !lv.active {
+        info!("re-export: activating {id}");
+        // -K: ignore the activation-skip flag thin snapshots are born with
+        let out = Command::new("/usr/sbin/lvchange")
+            .args(["-y", "-ay", "-K", &format!("{}/{id}", vg_name())])
+            .output()?;
+        if let Err(e) = check(out, "lvchange -ay") {
+            if let Some(pool) = thin_pool() {
+                warn!(
+                    "if {}/{pool} itself is inactive: install thin-provisioning-tools and check `journalctl -b | grep -i thin`",
+                    vg_name()
+                );
+            }
+            return Err(e);
+        }
+    }
+    let old = tag_value(&lv.tags, TAG_PORT).and_then(|v| v.parse::<u16>().ok());
+    let want = match old {
+        Some(p) if (min..=max).contains(&p) && !used.contains(&p) => p,
+        _ => {
+            let p = lowest_free(used, min, max).ok_or_else(|| {
+                Error::other(format!(
+                    "no free nvmet port in {min}-{max} ({} exported)",
+                    used.len()
+                ))
+            })?;
+            match old {
+                Some(o) => warn!("re-exporting {id} on {p} (was {o})"),
+                None => info!("re-exporting {id} on {p} (no port recorded)"),
+            }
+            p
+        }
+    };
+    export(id, want)?;
+    set_port_tag(id, &lv.tags, want)?;
+    Ok((want, old.is_some_and(|o| o != want)))
+}
+
+/// GET /reexport: run the startup pass again and report what it did.
+async fn reexport() -> std::result::Result<Json<ReexportSummary>, ApiError> {
+    run_blocking(move || {
+        let s = reexport_all();
+        remember_reexport(&s);
+        Ok(s)
+    })
+    .await
+    .map(Json)
+}
+
+/// Startup: re-export everything before the listener is bound, retrying
+/// while the underlay address is still missing, then keep retrying any
+/// leftovers in the background.
+async fn reexport_at_startup() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(reexport_wait());
+    let summary = loop {
+        let s = match tokio::task::spawn_blocking(reexport_all).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("re-export task: {e}");
+                break ReexportSummary::default();
+            }
+        };
+        remember_reexport(&s);
+        if !s.retry || std::time::Instant::now() >= deadline {
+            break s;
+        }
+        info!("re-export: address not available yet; retrying in 2s");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    };
+    if summary.failed.is_empty() {
+        return;
+    }
+    warn!(
+        "re-export: {} volume(s) still not exported; retrying every 10s",
+        summary.failed.len()
+    );
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            match tokio::task::spawn_blocking(reexport_all).await {
+                Ok(s) => {
+                    remember_reexport(&s);
+                    if s.failed.is_empty() {
+                        info!("re-export: every volume is exported now");
+                        break;
+                    }
+                }
+                Err(e) => error!("re-export retry task: {e}"),
+            }
+        }
+    });
 }
 
 /// One row of `lvs`.
@@ -686,9 +908,10 @@ async fn volumes() -> std::result::Result<Json<Vec<Volume>>, ApiError> {
 async fn utilization() -> std::result::Result<Json<Utilization>, ApiError> {
     let lvs = list_lvs().map_err(|e| api_err("lvs", e))?;
     let (vg_bytes, vg_free) = vg_space().map_err(|e| api_err("vgs", e))?;
-    summarize(&vg_name(), thin_pool().as_deref(), &lvs, vg_bytes, vg_free)
-        .map(Json)
-        .map_err(|e| api_err("utilization", e))
+    let mut u = summarize(&vg_name(), thin_pool().as_deref(), &lvs, vg_bytes, vg_free)
+        .map_err(|e| api_err("utilization", e))?;
+    u.reexport = last_reexport();
+    Ok(Json(u))
 }
 
 /// GET /clone/<id>[?bytes=N]: create a new volume that starts out as a copy
@@ -957,6 +1180,7 @@ fn summarize(
         volumes,
         max_layers,
         warnings,
+        reexport: None,
     };
     if let Some(pool) = pool {
         let p = lvs
@@ -1410,12 +1634,17 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Everything exported before the restart comes back before the first
+    // request can be served, so nobody sees a half-restored target.
+    reexport_at_startup().await;
+
     let app = Router::new()
         .route("/id/:id", get(attach).delete(detach))
         .route("/configure", get(configure))
         .route("/clone/:id", get(clone_volume))
         .route("/volumes", get(volumes))
-        .route("/utilization", get(utilization));
+        .route("/utilization", get(utilization))
+        .route("/reexport", get(reexport));
 
     info!(
         "vg={} thin_pool={:?} bind={} advertise={} nvmet={} ports={port_min}-{port_max}",
