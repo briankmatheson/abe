@@ -1120,11 +1120,54 @@ fn used_ports(root: &Path) -> BTreeSet<u16> {
     used
 }
 
-/// Under OPS: the port the next export goes on.
+/// The nvmet port range: ABE_PORT_MIN (default 44001) to ABE_PORT_MAX
+/// (default 44999). Err(message) if it does not satisfy
+/// `1 <= min <= max <= 65535`; main refuses to start on that.
+fn port_range() -> std::result::Result<(u16, u16), String> {
+    let get = |k: &str, d: u16| -> std::result::Result<u16, String> {
+        match var(k) {
+            Err(_) => Ok(d),
+            Ok(s) if s.is_empty() => Ok(d),
+            Ok(s) => s
+                .trim()
+                .parse::<u16>()
+                .map_err(|e| format!("{k}={s:?} is not a port number (1-65535): {e}")),
+        }
+    };
+    let (min, max) = (get("ABE_PORT_MIN", 44001)?, get("ABE_PORT_MAX", 44999)?);
+    if min == 0 {
+        return Err("ABE_PORT_MIN must be at least 1".to_string());
+    }
+    if min > max {
+        return Err(format!("ABE_PORT_MIN={min} is above ABE_PORT_MAX={max}"));
+    }
+    Ok((min, max))
+}
+
+/// `port_range()` after main has validated it.
+fn port_bounds() -> (u16, u16) {
+    port_range().unwrap_or((44001, 44999))
+}
+
+/// The lowest port in `min..=max` that is not in `used`.
+fn lowest_free(used: &BTreeSet<u16>, min: u16, max: u16) -> Option<u16> {
+    (min..=max).find(|p| !used.contains(p))
+}
+
+/// Under OPS: the port the next export goes on. 503 when the range is
+/// full.
 fn pick_port() -> Res<u16> {
+    let (min, max) = port_bounds();
     let used = used_ports(Path::new(&nvmet_path()));
-    let next = used.iter().next_back().map_or(44001, |p| p + 1);
-    Ok(next)
+    lowest_free(&used, min, max).ok_or_else(|| {
+        Fail::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "no free nvmet port in {min}-{max} ({} exported)",
+                used.len()
+            ),
+        )
+    })
 }
 
 /// Under OPS: export the LV `id` on `port`: subsystem, namespace, port
@@ -1354,6 +1397,14 @@ fn check(output: std::process::Output, what: &str) -> Result<()> {
 async fn main() {
     env_logger::init();
 
+    let (port_min, port_max) = match port_range() {
+        Ok(r) => r,
+        Err(e) => {
+            error!("bad port range: {e}");
+            std::process::exit(2);
+        }
+    };
+
     if let Err(e) = ensure_configfs_mounted().and_then(|_| ensure_nvmet_present()) {
         error!("cannot set up nvmet: {e}");
         std::process::exit(1);
@@ -1367,7 +1418,7 @@ async fn main() {
         .route("/utilization", get(utilization));
 
     info!(
-        "vg={} thin_pool={:?} bind={} advertise={} nvmet={}",
+        "vg={} thin_pool={:?} bind={} advertise={} nvmet={} ports={port_min}-{port_max}",
         vg_name(),
         thin_pool(),
         bind_traddr(),
@@ -1539,6 +1590,34 @@ mod tests {
         assert_eq!(parse_lv_size(""), None);
         assert_eq!(parse_lv_size("abc"), None);
         assert_eq!(parse_lv_size("10X"), None);
+    }
+
+    #[test]
+    fn picks_the_lowest_free_port() {
+        let used = |v: &[u16]| v.iter().copied().collect::<BTreeSet<u16>>();
+        assert_eq!(lowest_free(&used(&[]), 44001, 44999), Some(44001));
+        // a gap left by a delete is filled before anything higher
+        assert_eq!(
+            lowest_free(&used(&[44001, 44003]), 44001, 44999),
+            Some(44002)
+        );
+        assert_eq!(
+            lowest_free(&used(&[44001, 44002, 44003]), 44001, 44999),
+            Some(44004)
+        );
+        // ports outside the range do not matter
+        assert_eq!(
+            lowest_free(&used(&[1, 2, 65535]), 44001, 44002),
+            Some(44001)
+        );
+        // full
+        assert_eq!(lowest_free(&used(&[44001, 44002]), 44001, 44002), None);
+        // one-port range
+        assert_eq!(lowest_free(&used(&[]), 44001, 44001), Some(44001));
+        assert_eq!(lowest_free(&used(&[44001]), 44001, 44001), None);
+        // the ends of u16 do not overflow
+        assert_eq!(lowest_free(&used(&[65535]), 65535, 65535), None);
+        assert_eq!(lowest_free(&used(&[]), 65534, 65535), Some(65534));
     }
 
     /// A fresh directory under the system temp dir, removed on drop.
