@@ -2,9 +2,9 @@
 
 ## 📦 Package Built
 
-**File:** `/home/bmath/src/abe/target/debian/abe_0.1.0-1_amd64.deb`  
-**Size:** 811 KB  
-**Version:** 0.1.0-1
+**File:** `target/debian/abe-block-exporter_0.4.0-1_amd64.deb`  
+**Package:** `abe-block-exporter` (the binary, unit and defaults keep the short name `abe`)  
+**Version:** 0.4.0-1
 
 ## ⚠️ Security Warning
 
@@ -17,7 +17,7 @@
 ## Installation
 
 ```bash
-sudo dpkg -i ~/src/abe/target/debian/abe_0.1.0-1_amd64.deb
+sudo dpkg -i target/debian/abe-block-exporter_0.4.0-1_amd64.deb
 ```
 
 ## Setup
@@ -104,8 +104,8 @@ runcmd:
   - vgcreate abe /dev/vdb
   
   # Install ABE
-  - wget https://path/to/abe_0.1.0-1_amd64.deb
-  - dpkg -i abe_0.1.0-1_amd64.deb
+  - wget https://path/to/abe-block-exporter_0.4.0-1_amd64.deb
+  - dpkg -i abe-block-exporter_0.4.0-1_amd64.deb
   
   # Start ABE
   - systemctl start abe
@@ -140,7 +140,7 @@ See `src/main_secure_v1.rs.bak` for implementation.
 
 ```bash
 sudo systemctl stop abe
-sudo dpkg -r abe
+sudo dpkg -r abe-block-exporter
 ```
 
 **Note:** LVM volumes are NOT automatically deleted. Clean up manually:
