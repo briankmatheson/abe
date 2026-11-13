@@ -9,19 +9,44 @@ use log::{error, info, warn};
 use nix::mount::{mount, MsFlags};
 use nix::unistd::symlinkat;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::env::var;
 use std::fmt::Display;
 use std::fs::{self, write, File};
 use std::io::{Error, ErrorKind, Result, Write};
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str;
+use std::sync::Mutex;
 use uuid::Uuid;
 //use env_inventory;
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
-const NVMET_PATH: &str = "/sys/kernel/config/nvmet";
+
+/// Root of the nvmet configfs tree (ABE_NVMET_PATH, default
+/// /sys/kernel/config/nvmet). Overridable so the port scan can be tested
+/// against a plain directory.
+fn nvmet_path() -> String {
+    var("ABE_NVMET_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/sys/kernel/config/nvmet".to_string())
+}
+
+/// One process-wide lock around everything that changes LVM or configfs:
+/// LV create/partition/tag, export, unexport, lvremove, clone, seal and the
+/// startup re-export pass. fio and the trim after it run outside it (only
+/// the creating request knows the new id, so nobody else can touch the
+/// volume), and read-only handlers never take it.
+static OPS: Mutex<()> = Mutex::new(());
+
+/// Run `f` while holding OPS. A poisoned lock (a panic inside an earlier
+/// holder) is taken over rather than propagated: the LVM/configfs state is
+/// authoritative, not whatever the panicking request had in memory.
+fn with_ops<T, E>(f: impl FnOnce() -> std::result::Result<T, E>) -> std::result::Result<T, E> {
+    let _g = OPS.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
 
 /// Volume group the LVs live in. Override with ABE_VG.
 fn vg_name() -> String {
@@ -63,6 +88,10 @@ fn dashed_uuid(id: &str) -> Option<String> {
 /// ABE_VOL_SIZE. Accepts anything lvcreate -L does (e.g. "10G", "512M").
 fn default_vol_size() -> String {
     var("ABE_VOL_SIZE").unwrap_or_else(|_| "10G".to_string())
+}
+
+fn new_id() -> String {
+    Uuid::new_v4().to_string().replace("-", "")
 }
 
 /// Size of the LV called `id`, if it exists.
@@ -108,6 +137,63 @@ fn api_err<E: Display>(what: &str, e: E) -> ApiError {
     )
 }
 
+/// An error from the blocking side of a handler, with the HTTP status it
+/// should turn into. Plain io errors become 500s.
+#[derive(Debug)]
+struct Fail {
+    status: StatusCode,
+    error: String,
+}
+
+type Res<T> = std::result::Result<T, Fail>;
+
+impl Fail {
+    fn new(status: StatusCode, error: impl Into<String>) -> Self {
+        Fail {
+            status,
+            error: error.into(),
+        }
+    }
+    fn bad_request(error: impl Into<String>) -> Self {
+        Fail::new(StatusCode::BAD_REQUEST, error)
+    }
+    fn not_found(id: &str) -> Self {
+        Fail::new(StatusCode::NOT_FOUND, format!("no volume {id}"))
+    }
+    fn conflict(error: impl Into<String>) -> Self {
+        Fail::new(StatusCode::CONFLICT, error)
+    }
+    /// `.map_err(Fail::ctx("lvremove"))`: a 500 that says which step failed.
+    fn ctx(what: &'static str) -> impl FnOnce(Error) -> Fail {
+        move |e| Fail::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e}"))
+    }
+    fn into_api(self) -> ApiError {
+        if self.status.is_server_error() {
+            warn!("{}", self.error);
+        } else {
+            info!("{} -> {}", self.error, self.status.as_u16());
+        }
+        (self.status, Json(ErrorMessage { error: self.error }))
+    }
+}
+
+impl From<Error> for Fail {
+    fn from(e: Error) -> Self {
+        Fail::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    }
+}
+
+/// Run the blocking part of a handler on the blocking pool.
+async fn run_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Res<T> + Send + 'static,
+) -> std::result::Result<T, ApiError> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(f)) => Err(f.into_api()),
+        Err(e) => Err(api_err("blocking task", e)),
+    }
+}
+
 //env_inventory::register!(RUST_LOG = "info")
 
 #[derive(Serialize, Deserialize)]
@@ -125,6 +211,22 @@ struct Message {
     /// what fio measured on a freshly created volume (/configure only)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     perf: Option<Perf>,
+}
+
+impl Message {
+    /// The reply for `id` exported on `port`.
+    fn exported(id: &str, port: &str) -> Message {
+        let traddr = advertised_traddr();
+        Message {
+            message: format!("sudo nvme connect -a {traddr} -t tcp -s {port} -n {id}"),
+            id: id.to_string(),
+            port: port.to_string(),
+            traddr,
+            nqn: id.to_string(),
+            bytes: lv_bytes(id),
+            perf: None,
+        }
+    }
 }
 
 /// A short fio run on a new volume before it is handed out: random
@@ -256,6 +358,102 @@ struct Lv {
     metadata_percent: Option<f64>,
     metadata_bytes: Option<u64>,
     segtype: String,
+    /// LVM tags; abe's own are listed under TAG_*
+    tags: Vec<String>,
+    active: bool,
+}
+
+// LV tags: durable per-volume metadata that lives in the VG metadata and
+// survives reboots without a state file.
+/// `abe_port=<n>`: trsvcid the volume is exported on; re-export reuses it.
+const TAG_PORT: &str = "abe_port";
+/// `abe_name=<name>`: the caller's name, for idempotent create.
+const TAG_NAME: &str = "abe_name";
+/// `abe_base=<image>`: this volume is the base for `<image>`.
+const TAG_BASE: &str = "abe_base";
+/// `abe_sealed`: a base that is filled and frozen: never exported, clone-only.
+const TAG_SEALED: &str = "abe_sealed";
+
+/// Value of the `key=value` tag, if present.
+fn tag_value<'a>(tags: &'a [String], key: &str) -> Option<&'a str> {
+    tags.iter().find_map(|t| {
+        let (k, v) = t.split_once('=')?;
+        (k == key).then_some(v)
+    })
+}
+
+/// Is the bare tag `key` (or any `key=...`) present?
+fn has_tag(tags: &[String], key: &str) -> bool {
+    tags.iter()
+        .any(|t| t == key || t.split_once('=').is_some_and(|(k, _)| k == key))
+}
+
+/// Caller-supplied tag values (`name`, `image`) must match
+/// `^[A-Za-z0-9._+:-]{1,128}$`: a safe subset of what LVM allows in a tag.
+fn valid_tag_value(s: &str) -> bool {
+    (1..=128).contains(&s.len())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | ':' | '-'))
+}
+
+/// `lvchange --deltag .. --addtag .. vg/id` in one call. No-op when both
+/// lists are empty.
+fn retag(id: &str, del: &[String], add: &[String]) -> Result<()> {
+    if del.is_empty() && add.is_empty() {
+        return Ok(());
+    }
+    let mut cmd = Command::new("/usr/sbin/lvchange");
+    for t in del {
+        cmd.args(["--deltag", t]);
+    }
+    for t in add {
+        cmd.args(["--addtag", t]);
+    }
+    cmd.arg(format!("{}/{id}", vg_name()));
+    check(cmd.output()?, "lvchange tags")
+}
+
+/// Record the port `id` is exported on, replacing any earlier record.
+fn set_port_tag(id: &str, tags: &[String], port: u16) -> Result<()> {
+    let new = format!("{TAG_PORT}={port}");
+    let old: Vec<String> = tags
+        .iter()
+        .filter(|t| t.starts_with("abe_port=") && **t != new)
+        .cloned()
+        .collect();
+    if old.is_empty() && tags.contains(&new) {
+        return Ok(());
+    }
+    retag(id, &old, &[new])
+}
+
+/// The abe volume carrying exactly this tag, if any.
+fn find_tagged<'a>(lvs: &'a [Lv], tag: &str) -> Option<&'a Lv> {
+    lvs.iter()
+        .find(|l| is_volume_id(&l.name) && l.tags.iter().any(|t| t == tag))
+}
+
+/// What a create request is asking for, in bytes, when that is knowable
+/// (`?bytes=` always; `?size=` for the usual lvcreate suffixes).
+fn parse_lv_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let n: u64 = digits.parse().ok()?;
+    let unit = s[digits.len()..]
+        .trim()
+        .to_ascii_lowercase()
+        .trim_end_matches("ib")
+        .trim_end_matches('b')
+        .to_string();
+    let shift = match unit.as_str() {
+        "" | "m" => 20,
+        "k" => 10,
+        "g" => 30,
+        "t" => 40,
+        "p" => 50,
+        _ => return None,
+    };
+    n.checked_shl(shift)
 }
 
 async fn configure(
@@ -266,10 +464,13 @@ async fn configure(
         (None, Some(s)) if !s.is_empty() => s,
         _ => default_vol_size(),
     };
-    let id: String = Uuid::new_v4().to_string().replace("-", "");
-    create_lv(&id, &size, p.raw.unwrap_or(false)).map_err(|e| api_err("create_lv", e))?;
-    info!("attach id is {}", id);
-    let Json(mut m) = do_attach(id.clone()).await?;
+    let raw = p.raw.unwrap_or(false);
+    let id = new_id();
+    info!("configure: new volume {id} ({size}, raw={raw})");
+    let (mut m, _port) = {
+        let id = id.clone();
+        run_blocking(move || with_ops(|| create_and_export(&id, &size, raw, &[]))).await?
+    };
     // Measure after the export is set up so a fio problem cannot cost the
     // caller its volume; the data written is garbage on a blank volume.
     let dev = lv_path_for_uuid(&id);
@@ -286,6 +487,70 @@ async fn configure(
         }
     };
     Ok(Json(m))
+}
+
+/// Under OPS: make the LV, export it on a free port and tag it with
+/// `abe_port=<port>` plus `tags`. If anything after lvcreate fails the LV
+/// is removed again, so a failed create leaves nothing behind.
+fn create_and_export(id: &str, size: &str, raw: bool, tags: &[String]) -> Res<(Message, u16)> {
+    create_lv(id, size, raw).map_err(Fail::ctx("create_lv"))?;
+    export_new(id, tags).inspect_err(|_| rollback_lv(id))
+}
+
+/// Under OPS, for an LV that was just created: pick a port, export, tag.
+/// configfs is cleaned up on failure; the LV is the caller's to roll back.
+fn export_new(id: &str, tags: &[String]) -> Res<(Message, u16)> {
+    let port = pick_port()?;
+    let m = export(id, port).map_err(Fail::ctx("export"))?;
+    let mut add = tags.to_vec();
+    add.push(format!("{TAG_PORT}={port}"));
+    if let Err(e) = retag(id, &[], &add) {
+        if let Err(e2) = remove_export(id) {
+            warn!("could not unexport {id} after a tagging failure: {e2}");
+        }
+        return Err(Fail::ctx("lvchange tags")(e));
+    }
+    Ok((m, port))
+}
+
+/// Best effort `lvremove` of a volume whose creation failed half-way.
+fn rollback_lv(id: &str) {
+    let lv = lv_path_for_uuid(id);
+    if !Path::new(&lv).exists() {
+        return;
+    }
+    if let Err(e) = remove_holders(&lv) {
+        warn!("rollback of {id}: {e}");
+    }
+    match Command::new("/usr/sbin/lvremove")
+        .args(["-y", &lv])
+        .output()
+    {
+        Ok(o) if o.status.success() => info!("rolled back {lv}"),
+        Ok(o) => warn!(
+            "could not roll back {lv}: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => warn!("could not roll back {lv}: {e}"),
+    }
+}
+
+/// Under OPS: export `id` if it is not already, record the port, and
+/// return the connect reply either way (GET /id and re-export).
+fn export_or_existing(id: &str, tags: &[String]) -> Res<Message> {
+    if let Some(svc) = existing_export(id) {
+        info!("{id} already exported on port {svc}");
+        if let Ok(p) = svc.parse::<u16>() {
+            if let Err(e) = set_port_tag(id, tags, p) {
+                warn!("could not record port {p} on {id}: {e}");
+            }
+        }
+        return Ok(Message::exported(id, &svc));
+    }
+    let port = pick_port()?;
+    let m = export(id, port).map_err(Fail::ctx("export"))?;
+    set_port_tag(id, tags, port).map_err(Fail::ctx("lvchange tags"))?;
+    Ok(m)
 }
 
 /// Direct-I/O fio straight at the LV: random writes at ABE_FIO_BS,
@@ -356,54 +621,60 @@ fn parse_fio(json: &str, bs: &str, iodepth: u32) -> Option<Perf> {
     })
 }
 
+/// GET /id/<id>: (re-)export an existing volume. Idempotent.
 async fn attach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiError> {
     info!("attach id is {}", id);
-    if !Path::new(&lv_path_for_uuid(&id)).exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorMessage {
-                error: format!("no volume {id}"),
-            }),
-        ));
-    }
-    do_attach(id).await
+    run_blocking(move || {
+        with_ops(|| {
+            let lvs = list_lvs().map_err(Fail::ctx("lvs"))?;
+            let lv = lvs
+                .iter()
+                .find(|l| l.name == id)
+                .ok_or_else(|| Fail::not_found(&id))?;
+            export_or_existing(&id, &lv.tags)
+        })
+    })
+    .await
+    .map(Json)
 }
 
 /// DELETE /id/<id>: stop exporting the volume and remove its LV.
 /// Idempotent: returns 404 only if neither an export nor an LV exists.
 async fn detach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiError> {
     info!("delete id is {}", id);
-    let lv = lv_path_for_uuid(&id);
-    let exported = existing_export(&id).is_some();
+    run_blocking(move || with_ops(|| remove_volume(&id)))
+        .await
+        .map(Json)
+}
+
+/// Under OPS: unexport and lvremove.
+fn remove_volume(id: &str) -> Res<Message> {
+    let lv = lv_path_for_uuid(id);
+    let exported = existing_export(id).is_some();
     if !exported && !Path::new(&lv).exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorMessage {
-                error: format!("no volume {id}"),
-            }),
-        ));
+        return Err(Fail::not_found(id));
     }
-    let port = remove_export(&id).map_err(|e| api_err("nvmet teardown", e))?;
+    let port = remove_export(id).map_err(Fail::ctx("nvmet teardown"))?;
     if Path::new(&lv).exists() {
-        remove_holders(&lv).map_err(|e| api_err("remove partition mappings", e))?;
+        remove_holders(&lv).map_err(Fail::ctx("remove partition mappings"))?;
         check(
             Command::new("/usr/sbin/lvremove")
                 .args(["-y", &lv])
                 .output()
-                .map_err(|e| api_err("lvremove", e))?,
+                .map_err(Fail::ctx("lvremove"))?,
             "lvremove",
         )
-        .map_err(|e| api_err("lvremove", e))?;
+        .map_err(Fail::ctx("lvremove"))?;
     }
-    Ok(Json(Message {
+    Ok(Message {
         message: format!("deleted {id}"),
-        nqn: id.clone(),
-        id,
+        nqn: id.to_string(),
+        id: id.to_string(),
         port: port.unwrap_or_default(),
         traddr: advertised_traddr(),
         bytes: None,
         perf: None,
-    }))
+    })
 }
 
 /// GET /volumes: every volume in the VG (exported or not).
@@ -428,53 +699,50 @@ async fn clone_volume(
     Query(p): Query<CloneParams>,
 ) -> std::result::Result<Json<CloneReply>, ApiError> {
     info!("clone of {origin}");
-    let bad = |code, error: String| (code, Json(ErrorMessage { error }));
-    let lvs = list_lvs().map_err(|e| api_err("lvs", e))?;
+    run_blocking(move || with_ops(|| clone_locked(&origin, &p)))
+        .await
+        .map(Json)
+}
+
+/// Under OPS: the whole of /clone (no fio runs on a clone).
+fn clone_locked(origin: &str, p: &CloneParams) -> Res<CloneReply> {
+    let lvs = list_lvs().map_err(Fail::ctx("lvs"))?;
     let Some(src) = lvs.iter().find(|l| l.name == origin) else {
-        return Err(bad(StatusCode::NOT_FOUND, format!("no volume {origin}")));
+        return Err(Fail::not_found(origin));
     };
     if src.segtype != "thin" || src.pool.is_none() || src.pool != thin_pool() {
-        return Err(bad(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "{origin} is not a thin volume in abe's pool ({}/{}); only those can be cloned",
-                vg_name(),
-                thin_pool().unwrap_or_else(|| "<ABE_THIN_POOL not set>".to_string())
-            ),
-        ));
+        return Err(Fail::bad_request(format!(
+            "{origin} is not a thin volume in abe's pool ({}/{}); only those can be cloned",
+            vg_name(),
+            thin_pool().unwrap_or_else(|| "<ABE_THIN_POOL not set>".to_string())
+        )));
     }
     if let Some(b) = p.bytes {
         if b < src.bytes {
-            return Err(bad(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "a clone cannot be smaller than its origin ({b} < {} bytes)",
-                    src.bytes
-                ),
-            ));
+            return Err(Fail::bad_request(format!(
+                "a clone cannot be smaller than its origin ({b} < {} bytes)",
+                src.bytes
+            )));
         }
     }
     let grow_to = p.bytes.filter(|b| *b > src.bytes);
 
-    let id: String = Uuid::new_v4().to_string().replace("-", "");
-    let layers = layers(&lvs, &origin) + 1;
+    let id = new_id();
+    let layers = layers(&lvs, origin) + 1;
     let warning = layer_warning(&id, layers);
     if let Some(w) = &warning {
         warn!("{w}");
     }
-    clone_lv(&origin, &id, grow_to).map_err(|e| api_err("clone_lv", e))?;
-    let bytes = list_lvs()
-        .ok()
-        .and_then(|l| l.into_iter().find(|l| l.name == id).map(|l| l.bytes))
-        .unwrap_or(grow_to.unwrap_or(src.bytes));
-    let Json(export) = do_attach(id).await?;
-    Ok(Json(CloneReply {
+    clone_lv(origin, &id, grow_to).map_err(Fail::ctx("clone_lv"))?;
+    let (export, _port) = export_new(&id, &[]).inspect_err(|_| rollback_lv(&id))?;
+    let bytes = export.bytes.unwrap_or(grow_to.unwrap_or(src.bytes));
+    Ok(CloneReply {
         export,
         bytes,
-        origin,
+        origin: origin.to_string(),
         layers,
         warning,
-    }))
+    })
 }
 
 /// Thin snapshot of `origin` named `name`, activated, optionally grown to
@@ -533,8 +801,9 @@ fn is_volume_id(name: &str) -> bool {
     name.len() == 32 && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// `lv_tags` and `lv_active` are last so the earlier indices never move.
 const LVS_FIELDS: &str =
-    "lv_name,lv_size,pool_lv,origin,data_percent,metadata_percent,lv_metadata_size,segtype";
+    "lv_name,lv_size,pool_lv,origin,data_percent,metadata_percent,lv_metadata_size,segtype,lv_tags,lv_active";
 
 /// Every LV in the VG.
 fn list_lvs() -> Result<Vec<Lv>> {
@@ -557,6 +826,7 @@ fn list_lvs() -> Result<Vec<Lv>> {
 }
 
 /// Parse `lvs --noheadings --units b --nosuffix --separator '|' -o LVS_FIELDS`.
+/// Tags come comma-separated; `lv_active` is `active` or empty.
 fn parse_lvs(text: &str) -> Vec<Lv> {
     let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
     let mut lvs = Vec::new();
@@ -576,6 +846,17 @@ fn parse_lvs(text: &str) -> Vec<Lv> {
             metadata_percent: f[5].parse().ok(),
             metadata_bytes: f[6].parse().ok(),
             segtype: f[7].to_string(),
+            tags: f
+                .get(8)
+                .map(|t| {
+                    t.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            active: f.get(9).is_none_or(|a| a.starts_with("active")),
         });
     }
     lvs
@@ -762,8 +1043,9 @@ fn remove_holders(lv: &str) -> Result<()> {
 /// Tear down the nvmet port + subsystem for `id`. Returns the trsvcid the
 /// volume was exported on, if any. Missing pieces are not errors.
 fn remove_export(id: &str) -> Result<Option<String>> {
+    let root = nvmet_path();
     let mut svc = None;
-    if let Ok(ports) = fs::read_dir(format!("{NVMET_PATH}/ports")) {
+    if let Ok(ports) = fs::read_dir(format!("{root}/ports")) {
         for p in ports.flatten() {
             let link = p.path().join("subsystems").join(id);
             if !link.exists() {
@@ -784,7 +1066,7 @@ fn remove_export(id: &str) -> Result<Option<String>> {
             }
         }
     }
-    let subsys = PathBuf::from(format!("{NVMET_PATH}/subsystems/{id}"));
+    let subsys = PathBuf::from(format!("{root}/subsystems/{id}"));
     if subsys.exists() {
         if let Ok(nss) = fs::read_dir(subsys.join("namespaces")) {
             for ns in nss.flatten() {
@@ -801,7 +1083,7 @@ fn remove_export(id: &str) -> Result<Option<String>> {
 
 /// If `id` is already exported, return the port it is exported on.
 fn existing_export(id: &str) -> Option<String> {
-    let ports = fs::read_dir(format!("{NVMET_PATH}/ports")).ok()?;
+    let ports = fs::read_dir(format!("{}/ports", nvmet_path())).ok()?;
     for p in ports.flatten() {
         if p.path().join("subsystems").join(id).exists() {
             let svc = fs::read_to_string(p.path().join("addr_trsvcid")).ok()?;
@@ -811,70 +1093,62 @@ fn existing_export(id: &str) -> Option<String> {
     None
 }
 
-/// Highest numbered nvmet port directory (0 if none).
-fn last_port_number() -> u32 {
-    fs::read_dir(format!("{NVMET_PATH}/ports"))
-        .map(|rd| {
-            rd.flatten()
-                .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()))
-                .max()
-                .unwrap_or(0)
-        })
-        .unwrap_or(0)
+/// Every trsvcid in use under `root/ports/*`. Port directory names are
+/// opaque (older abe versions numbered them 1, 2, ...); only
+/// `addr_trsvcid` counts. Entries that do not parse are logged and skipped.
+fn used_ports(root: &Path) -> BTreeSet<u16> {
+    let mut used = BTreeSet::new();
+    let Ok(ports) = fs::read_dir(root.join("ports")) else {
+        return used;
+    };
+    for p in ports.flatten() {
+        let f = p.path().join("addr_trsvcid");
+        match fs::read_to_string(&f) {
+            Ok(s) => match s.trim().parse::<u16>() {
+                Ok(n) => {
+                    used.insert(n);
+                }
+                Err(_) => warn!(
+                    "{}: trsvcid {:?} is not a port number",
+                    f.display(),
+                    s.trim()
+                ),
+            },
+            Err(e) => warn!("{}: {e}", f.display()),
+        }
+    }
+    used
 }
 
-async fn do_attach(id: String) -> std::result::Result<Json<Message>, ApiError> {
-    let traddr = advertised_traddr();
+/// Under OPS: the port the next export goes on.
+fn pick_port() -> Res<u16> {
+    let used = used_ports(Path::new(&nvmet_path()));
+    let next = used.iter().next_back().map_or(44001, |p| p + 1);
+    Ok(next)
+}
 
-    // Idempotent: re-attaching an exported volume just reports where it is.
-    if let Some(svc) = existing_export(&id) {
-        info!("{id} already exported on port {svc}");
-        return Ok(Json(Message {
-            message: format!("sudo nvme connect -a {traddr} -t tcp -s {svc} -n {id}"),
-            nqn: id.clone(),
-            bytes: lv_bytes(&id),
-            id,
-            port: svc,
-            traddr,
-            perf: None,
-        }));
+/// Under OPS: export the LV `id` on `port`: subsystem, namespace, port
+/// directory, link. If any step after the subsystem directory exists
+/// fails, the export is torn down again before the error is returned, so
+/// a failed export leaves no configfs junk behind.
+fn export(id: &str, port: u16) -> Result<Message> {
+    info!("exporting {id} on port {port}");
+    let lv_path = lv_path_for_uuid(id);
+    let steps = || -> Result<()> {
+        let target = Subsystem::create(id)?;
+        target.add_namespace("1", &lv_path)?;
+        let p = Port::create(port, "tcp")?;
+        p.link_subsystem(&target)?;
+        Ok(())
+    };
+    if let Err(e) = steps() {
+        warn!("export of {id} on {port} failed: {e}; cleaning up");
+        if let Err(e2) = remove_export(id) {
+            warn!("cleanup of {id} failed too: {e2}");
+        }
+        return Err(e);
     }
-
-    let i = last_port_number() + 1;
-    info!("allocating port {i}");
-
-    let lv_path = lv_path_for_uuid(&id);
-
-    let target = Subsystem::create(&id)
-        .await
-        .map_err(|e| api_err("nvmet subsystem", e))?;
-    target
-        .add_namespace("1", &lv_path)
-        .await
-        .map_err(|e| api_err("nvmet namespace", e))?;
-
-    let svc_port = format!("44{:03}", i);
-    info!("svc_port is {svc_port}");
-
-    let port =
-        Port::create(id.clone(), &svc_port, "tcp", i).map_err(|e| api_err("nvmet port", e))?;
-    port.link_subsystem(&target)
-        .map_err(|e| api_err("nvmet port link", e))?;
-
-    println!("{} {}:{}", port.id, port.traddr, port.trsvcid);
-
-    Ok(Json(Message {
-        message: format!(
-            "sudo nvme discover -a {} -t tcp -s {} ; sudo nvme connect -a {} -t tcp -s {} -n {}",
-            traddr, port.trsvcid, traddr, port.trsvcid, id
-        ),
-        nqn: id.clone(),
-        bytes: lv_bytes(&id),
-        id,
-        port: port.trsvcid,
-        traddr,
-        perf: None,
-    }))
+    Ok(Message::exported(id, &port.to_string()))
 }
 
 // NVME over TCP target subsystem
@@ -882,8 +1156,8 @@ struct Subsystem {
     name: String,
 }
 impl Subsystem {
-    async fn create(name: &str) -> Result<Self> {
-        let path = format!("{}/subsystems/{}", NVMET_PATH, name);
+    fn create(name: &str) -> Result<Self> {
+        let path = format!("{}/subsystems/{}", nvmet_path(), name);
 
         info!("making nvmet subsystem dir");
         fs::create_dir_all(&path)?;
@@ -894,10 +1168,12 @@ impl Subsystem {
             name: name.to_string(),
         })
     }
-    async fn add_namespace(&self, nsid: &str, device_path: &str) -> Result<()> {
+    fn add_namespace(&self, nsid: &str, device_path: &str) -> Result<()> {
         let ns_path = format!(
             "{}/subsystems/{}/namespaces/{}",
-            NVMET_PATH, self.name, nsid
+            nvmet_path(),
+            self.name,
+            nsid
         );
         info!("making namespace {ns_path}");
         fs::create_dir_all(&ns_path)?;
@@ -919,50 +1195,57 @@ impl Subsystem {
     }
 }
 
-// NVME over TCP port
+// NVME over TCP port. The configfs directory is named after the port
+// number itself (`ports/44003`); nvmet port ids are u16 so they fit.
 struct Port {
-    id: String,
     traddr: String,
     trsvcid: String,
-    iteration: u32,
+    dir: PathBuf,
 }
 impl Port {
-    fn create(id: String, svcid: &str, trtype: &str, iteration: u32) -> Result<Port> {
-        let path = format!("{}/ports/{}", NVMET_PATH, iteration);
-        info!("making port {path}");
+    fn create(port: u16, trtype: &str) -> Result<Port> {
+        let dir = PathBuf::from(format!("{}/ports/{port}", nvmet_path()));
+        if dir.exists() {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                format!("{} already exists", dir.display()),
+            ));
+        }
+        info!("making port {}", dir.display());
         // nvmet-tcp accepts 0.0.0.0 to listen on every interface; override
         // with ABE_TRADDR to pin a specific one.
         let traddr: String = bind_traddr();
-        let trsvcid: String = svcid.to_string();
-        fs::create_dir_all(&path)?;
-        info!("writing addr_traddr {path}");
-        File::create(format!("{}/addr_traddr", path))?.write_all(traddr.as_bytes())?;
+        let trsvcid: String = port.to_string();
+        fs::create_dir_all(&dir)?;
+        info!("writing addr_traddr {traddr}");
+        File::create(dir.join("addr_traddr"))?.write_all(traddr.as_bytes())?;
 
-        info!("writing addr_trsvcid{path}");
-        File::create(format!("{}/addr_trsvcid", path))?.write_all(trsvcid.as_bytes())?;
+        info!("writing addr_trsvcid {trsvcid}");
+        File::create(dir.join("addr_trsvcid"))?.write_all(trsvcid.as_bytes())?;
 
-        info!("making addr_trtype {path}");
-        File::create(format!("{}/addr_trtype", path))?.write_all(trtype.as_bytes())?;
+        info!("writing addr_trtype {trtype}");
+        File::create(dir.join("addr_trtype"))?.write_all(trtype.as_bytes())?;
 
-        info!("making addr_adrfam {path}");
-        File::create(format!("{}/addr_adrfam", path))?.write_all("ipv4".as_bytes())?;
+        info!("writing addr_adrfam ipv4");
+        File::create(dir.join("addr_adrfam"))?.write_all("ipv4".as_bytes())?;
         Ok(Port {
-            id,
             traddr,
             trsvcid,
-            iteration,
+            dir,
         })
     }
 
+    /// Link the subsystem into the port, which is what makes nvmet listen.
     fn link_subsystem(&self, subsystem: &Subsystem) -> Result<()> {
-        let subsys_path: String = format!("{}/subsystems/{}", NVMET_PATH, subsystem.name);
-        let port_subsys_link: String = format!(
-            "{}/ports/{}/subsystems/{}",
-            NVMET_PATH, self.iteration, subsystem.name
+        let subsys_path = format!("{}/subsystems/{}", nvmet_path(), subsystem.name);
+        let link = self.dir.join("subsystems").join(&subsystem.name);
+        info!(
+            "linking {} -> {subsys_path} ({}:{})",
+            link.display(),
+            self.traddr,
+            self.trsvcid
         );
-        info!("linking port to subsystem");
-        symlinkat(subsys_path.as_str(), None, port_subsys_link.as_str())?;
-
+        symlinkat(subsys_path.as_str(), None, &link)?;
         Ok(())
     }
 }
@@ -990,7 +1273,7 @@ fn lv_path_for_uuid(uuid: &str) -> String {
 
 fn ensure_nvmet_present() -> Result<()> {
     info!("making nvmet subsystem");
-    if !Path::new(NVMET_PATH).exists() {
+    if !Path::new(&nvmet_path()).exists() {
         Command::new("modprobe")
             .args(["nvmet"])
             .output()
@@ -1084,11 +1367,12 @@ async fn main() {
         .route("/utilization", get(utilization));
 
     info!(
-        "vg={} thin_pool={:?} bind={} advertise={}",
+        "vg={} thin_pool={:?} bind={} advertise={} nvmet={}",
         vg_name(),
         thin_pool(),
         bind_traddr(),
-        advertised_traddr()
+        advertised_traddr(),
+        nvmet_path()
     );
     let listener = tokio::net::TcpListener::bind(listen_addr()).await.unwrap();
     if let Ok(addrs) = get_if_addrs() {
@@ -1107,14 +1391,14 @@ mod tests {
 
     // What `lvs --noheadings --units b --nosuffix --separator '|' -o LVS_FIELDS`
     // prints: a thick LV, a thin pool, a base image, two abe volumes (the
-    // second a clone of the first) and an inactive snapshot.
+    // second a clone of the first, both tagged) and an inactive snapshot.
     const LVS: &str = "\
-  root|99996401664||||||linear
-  abe|1398887514112|||12.34|10.50|2147483648|thin-pool
-  base-xdebbie-base|10737418240|abe||25.00|||thin
-  0123456789abcdef0123456789abcdef|42949672960|abe|base-xdebbie-base|50.00|||thin
-  fedcba9876543210fedcba9876543210|42949672960|abe|0123456789abcdef0123456789abcdef|0.00|||thin
-  parked|10737418240|abe|[gone]||||thin
+  root|99996401664||||||linear||active
+  abe|1398887514112|||12.34|10.50|2147483648|thin-pool||active
+  base-xdebbie-base|10737418240|abe||25.00|||thin||active
+  0123456789abcdef0123456789abcdef|42949672960|abe|base-xdebbie-base|50.00|||thin|abe_port=44001,abe_name=vol-a|active
+  fedcba9876543210fedcba9876543210|42949672960|abe|0123456789abcdef0123456789abcdef|0.00|||thin|abe_port=44002|active
+  parked|10737418240|abe|[gone]||||thin||
 ";
 
     fn thin(name: &str, origin: Option<&str>) -> Lv {
@@ -1127,6 +1411,8 @@ mod tests {
             metadata_percent: None,
             metadata_bytes: None,
             segtype: "thin".to_string(),
+            tags: Vec::new(),
+            active: true,
         }
     }
 
@@ -1154,6 +1440,8 @@ mod tests {
                 metadata_percent: None,
                 metadata_bytes: None,
                 segtype: "linear".into(),
+                tags: vec![],
+                active: true,
             }
         );
         assert_eq!(lvs[1].segtype, "thin-pool");
@@ -1164,6 +1452,134 @@ mod tests {
         assert_eq!(lvs[3].origin.as_deref(), Some("base-xdebbie-base"));
         assert_eq!(lvs[5].origin.as_deref(), Some("gone"));
         assert_eq!(lvs[5].data_percent, None);
+        // tags: none, one, several; active: yes, and the parked snapshot no
+        assert!(lvs[2].tags.is_empty());
+        assert_eq!(
+            lvs[3].tags,
+            vec!["abe_port=44001".to_string(), "abe_name=vol-a".to_string()]
+        );
+        assert_eq!(lvs[4].tags, vec!["abe_port=44002".to_string()]);
+        assert!(lvs[3].active);
+        assert!(!lvs[5].active);
+    }
+
+    #[test]
+    fn parses_lvs_without_the_tag_columns() {
+        // output of an older LVS_FIELDS (or a short fixture) still parses
+        let lvs = parse_lvs("  root|99996401664||||||linear\n");
+        assert_eq!(lvs.len(), 1);
+        assert!(lvs[0].tags.is_empty());
+        assert!(lvs[0].active);
+    }
+
+    #[test]
+    fn reads_tags() {
+        let tags: Vec<String> = ["abe_port=44001", "abe_name=vol-a", "abe_sealed", "other"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(tag_value(&tags, "abe_port"), Some("44001"));
+        assert_eq!(tag_value(&tags, "abe_name"), Some("vol-a"));
+        assert_eq!(tag_value(&tags, "abe_base"), None);
+        assert_eq!(tag_value(&tags, "abe_sealed"), None);
+        assert!(has_tag(&tags, "abe_sealed"));
+        assert!(has_tag(&tags, "abe_port"));
+        assert!(has_tag(&tags, "other"));
+        assert!(!has_tag(&tags, "abe_base"));
+        assert!(!has_tag(&tags, "abe"));
+        assert!(!has_tag(&[], "abe_sealed"));
+        let lvs = parse_lvs(LVS);
+        assert_eq!(
+            find_tagged(&lvs, "abe_name=vol-a").map(|l| l.name.as_str()),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(find_tagged(&lvs, "abe_name=vol-b").is_none());
+        // only abe volumes count, whatever they are tagged
+        assert!(find_tagged(&lvs, "abe_port=44001").is_some());
+    }
+
+    #[test]
+    fn validates_names_and_images() {
+        for ok in [
+            "a",
+            "vol-x",
+            "vm-0123-root",
+            "debian-12.5+cloud:amd64",
+            "a_b",
+            &"x".repeat(128),
+        ] {
+            assert!(valid_tag_value(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "",
+            " ",
+            "a b",
+            "a/b",
+            "a=b",
+            "a,b",
+            "ü",
+            "a\n",
+            &"x".repeat(129),
+            "a@b",
+            "a#b",
+        ] {
+            assert!(!valid_tag_value(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn parses_lv_sizes() {
+        assert_eq!(parse_lv_size("10G"), Some(10 << 30));
+        assert_eq!(parse_lv_size("512M"), Some(512 << 20));
+        assert_eq!(parse_lv_size("512"), Some(512 << 20));
+        assert_eq!(parse_lv_size("1T"), Some(1 << 40));
+        assert_eq!(parse_lv_size("64MiB"), Some(64 << 20));
+        assert_eq!(parse_lv_size("4k"), Some(4096));
+        assert_eq!(parse_lv_size("2GB"), Some(2 << 30));
+        assert_eq!(parse_lv_size(""), None);
+        assert_eq!(parse_lv_size("abc"), None);
+        assert_eq!(parse_lv_size("10X"), None);
+    }
+
+    /// A fresh directory under the system temp dir, removed on drop.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            let d = std::env::temp_dir().join(format!("abe-test-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&d);
+            fs::create_dir_all(&d).unwrap();
+            TempDir(d)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn scans_used_ports() {
+        let t = TempDir::new("ports");
+        // no ports directory at all
+        assert!(used_ports(&t.0).is_empty());
+        // old-style small directory names and new port-named ones, one
+        // unparseable entry and one without the attribute
+        for (dir, svc) in [
+            ("1", "44001\n"),
+            ("2", "44003"),
+            ("44002", "44002\n"),
+            ("7", "bogus"),
+        ] {
+            let d = t.0.join("ports").join(dir);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("addr_trsvcid"), svc).unwrap();
+        }
+        fs::create_dir_all(t.0.join("ports").join("9")).unwrap();
+        let used = used_ports(&t.0);
+        assert_eq!(
+            used.into_iter().collect::<Vec<_>>(),
+            vec![44001, 44002, 44003]
+        );
     }
 
     #[test]
