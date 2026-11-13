@@ -17,3 +17,8 @@
 
 # HTTP API listen address (default: 0.0.0.0:80).
 #ABE_LISTEN=0.0.0.0:80
+
+# nvmet TCP port range for exports (defaults: 44001-44999). Each export takes
+# the lowest free port; /configure answers 503 when the range is full.
+#ABE_PORT_MIN=44001
+#ABE_PORT_MAX=44999
