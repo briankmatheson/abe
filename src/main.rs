@@ -119,6 +119,9 @@ struct ConfigureParams {
     /// leave the volume blank instead of writing a GPT with one partition
     /// (VM disk images bring their own partition table)
     raw: Option<bool>,
+    /// idempotency key: if a volume tagged `abe_name=<name>` exists it is
+    /// returned (with `existing: true`) instead of a new one being made
+    name: Option<String>,
 }
 
 type ApiError = (StatusCode, Json<ErrorMessage>);
@@ -211,6 +214,9 @@ struct Message {
     /// what fio measured on a freshly created volume (/configure only)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     perf: Option<Perf>,
+    /// true when `?name=` matched a volume that already existed
+    #[serde(default)]
+    existing: bool,
 }
 
 impl Message {
@@ -225,6 +231,7 @@ impl Message {
             nqn: id.to_string(),
             bytes: lv_bytes(id),
             perf: None,
+            existing: false,
         }
     }
 }
@@ -309,6 +316,8 @@ const MAX_SNAPSHOT_LAYERS: u32 = 10;
 struct CloneParams {
     /// size of the clone; defaults to the origin's, and cannot be smaller
     bytes: Option<u64>,
+    /// idempotency key, as for /configure
+    name: Option<String>,
 }
 
 /// Reply of GET /clone/<id>: the usual export reply plus where the clone
@@ -691,12 +700,35 @@ async fn configure(
         _ => default_vol_size(),
     };
     let raw = p.raw.unwrap_or(false);
-    let id = new_id();
-    info!("configure: new volume {id} ({size}, raw={raw})");
-    let (mut m, _port) = {
-        let id = id.clone();
-        run_blocking(move || with_ops(|| create_and_export(&id, &size, raw, &[]))).await?
-    };
+    if let Some(n) = &p.name {
+        if !valid_tag_value(n) {
+            return Err(Fail::bad_request(format!(
+                "bad name {n:?}: use [A-Za-z0-9._+:-]{{1,128}}"
+            ))
+            .into_api());
+        }
+    }
+    let want = p.bytes.or_else(|| parse_lv_size(&size));
+    let name = p.name.clone();
+    let mut m = run_blocking(move || {
+        with_ops(|| {
+            if let Some(name) = &name {
+                let lvs = list_lvs().map_err(Fail::ctx("lvs"))?;
+                if let Some(lv) = find_tagged(&lvs, &format!("{TAG_NAME}={name}")) {
+                    return existing_named(lv, name, want);
+                }
+            }
+            let id = new_id();
+            info!("configure: new volume {id} ({size}, raw={raw}, name={name:?})");
+            let tags: Vec<String> = name.iter().map(|n| format!("{TAG_NAME}={n}")).collect();
+            create_and_export(&id, &size, raw, &tags).map(|(m, _port)| m)
+        })
+    })
+    .await?;
+    if m.existing {
+        return Ok(Json(m));
+    }
+    let id = m.id.clone();
     // Measure after the export is set up so a fio problem cannot cost the
     // caller its volume. fio stays inside partition 1 on a non-raw volume
     // and the region is trimmed afterwards, so the caller gets a blank
@@ -770,6 +802,23 @@ fn fio_region(bytes: u64, raw: bool) -> Option<Region> {
     };
     let len = (end.saturating_sub(start)).min(GIB) & !(MIB - 1);
     (len >= 16 * MIB).then_some(Region { offset: start, len })
+}
+
+/// Under OPS: `?name=` matched `lv`. Hand it back (exported) unless it is
+/// smaller than what is being asked for now.
+fn existing_named(lv: &Lv, name: &str, want: Option<u64>) -> Res<Message> {
+    if let Some(w) = want {
+        if lv.bytes < w {
+            return Err(Fail::conflict(format!(
+                "{} is already named {name} but has {} bytes, fewer than the {w} requested",
+                lv.name, lv.bytes
+            )));
+        }
+    }
+    info!("{name}: returning existing volume {}", lv.name);
+    let mut m = export_or_existing(&lv.name, &lv.tags)?;
+    m.existing = true;
+    Ok(m)
 }
 
 /// Under OPS: make the LV, export it on a free port and tag it with
@@ -1042,6 +1091,7 @@ fn remove_volume(id: &str) -> Res<Message> {
         traddr: advertised_traddr(),
         bytes: None,
         perf: None,
+        existing: false,
     })
 }
 
@@ -1075,7 +1125,28 @@ async fn clone_volume(
 
 /// Under OPS: the whole of /clone (no fio runs on a clone).
 fn clone_locked(origin: &str, p: &CloneParams) -> Res<CloneReply> {
+    if let Some(n) = &p.name {
+        if !valid_tag_value(n) {
+            return Err(Fail::bad_request(format!(
+                "bad name {n:?}: use [A-Za-z0-9._+:-]{{1,128}}"
+            )));
+        }
+    }
     let lvs = list_lvs().map_err(Fail::ctx("lvs"))?;
+    if let Some(name) = &p.name {
+        // A retry: the clone exists (even if its origin is gone by now).
+        if let Some(lv) = find_tagged(&lvs, &format!("{TAG_NAME}={name}")) {
+            let export = existing_named(lv, name, p.bytes)?;
+            let n = layers(&lvs, &lv.name);
+            return Ok(CloneReply {
+                bytes: lv.bytes,
+                origin: lv.origin.clone().unwrap_or_else(|| origin.to_string()),
+                layers: n,
+                warning: layer_warning(&lv.name, n),
+                export,
+            });
+        }
+    }
     let Some(src) = lvs.iter().find(|l| l.name == origin) else {
         return Err(Fail::not_found(origin));
     };
@@ -1103,7 +1174,8 @@ fn clone_locked(origin: &str, p: &CloneParams) -> Res<CloneReply> {
         warn!("{w}");
     }
     clone_lv(origin, &id, grow_to).map_err(Fail::ctx("clone_lv"))?;
-    let (export, _port) = export_new(&id, &[]).inspect_err(|_| rollback_lv(&id))?;
+    let tags: Vec<String> = p.name.iter().map(|n| format!("{TAG_NAME}={n}")).collect();
+    let (export, _port) = export_new(&id, &tags).inspect_err(|_| rollback_lv(&id))?;
     let bytes = export.bytes.unwrap_or(grow_to.unwrap_or(src.bytes));
     Ok(CloneReply {
         export,
