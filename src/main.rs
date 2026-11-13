@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path as EP, Query},
+    extract::{ConnectInfo, Path as EP, Query},
     http::StatusCode,
     routing::get,
     Json, Router,
@@ -522,6 +522,20 @@ impl Fail {
 impl From<Error> for Fail {
     fn from(e: Error) -> Self {
         Fail::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    }
+}
+
+/// The IPv4 address a request came from: what its port is fenced to. A
+/// v4-mapped v6 peer (a dual-stack listener) is unmapped; anything else
+/// is a 400, since the fence is IPv4-only.
+fn client_ip(peer: SocketAddr) -> Res<Ipv4Addr> {
+    match peer.ip() {
+        std::net::IpAddr::V4(a) => Ok(a),
+        std::net::IpAddr::V6(a) => a.to_ipv4_mapped().ok_or_else(|| {
+            Fail::bad_request(format!(
+                "fence needs an IPv4 client address (request came from {a})"
+            ))
+        }),
     }
 }
 
@@ -1214,8 +1228,10 @@ fn parse_lv_size(s: &str) -> Option<u64> {
 }
 
 async fn configure(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(p): Query<ConfigureParams>,
 ) -> std::result::Result<Json<Message>, ApiError> {
+    let client = client_ip(peer).map_err(Fail::into_api)?;
     let size = match (p.bytes, p.size) {
         (Some(b), _) => bytes_to_lv_size(b),
         (None, Some(s)) if !s.is_empty() => s,
@@ -1243,20 +1259,20 @@ async fn configure(
                 let lvs = list_lvs().map_err(Fail::ctx("lvs"))?;
                 if let Some(image) = &base {
                     if let Some(lv) = find_tagged(&lvs, &format!("{TAG_BASE}={image}")) {
-                        return existing_base(lv, image, want);
+                        return existing_base(lv, image, want, client);
                     }
                     tags.push(format!("{TAG_BASE}={image}"));
                 }
                 if let Some(name) = &name {
                     if let Some(lv) = find_tagged(&lvs, &format!("{TAG_NAME}={name}")) {
-                        return existing_named(lv, name, want);
+                        return existing_named(lv, name, want, client);
                     }
                     tags.push(format!("{TAG_NAME}={name}"));
                 }
             }
             let id = new_id();
-            info!("configure: new volume {id} ({size}, raw={raw}, name={name:?}, base={base:?})");
-            let (mut m, _port) = create_and_export(&id, &size, raw, &tags)?;
+            info!("configure: new volume {id} ({size}, raw={raw}, name={name:?}, base={base:?}) for {client}");
+            let (mut m, _port) = create_and_export(&id, &size, raw, &tags, client)?;
             if base.is_some() {
                 m.base = base.clone();
                 m.sealed = Some(false);
@@ -1346,7 +1362,7 @@ fn fio_region(bytes: u64, raw: bool) -> Option<Region> {
 
 /// Under OPS: `?name=` matched `lv`. Hand it back (exported) unless it is
 /// smaller than what is being asked for now.
-fn existing_named(lv: &Lv, name: &str, want: Option<u64>) -> Res<Message> {
+fn existing_named(lv: &Lv, name: &str, want: Option<u64>, client: Ipv4Addr) -> Res<Message> {
     if let Some(w) = want {
         if lv.bytes < w {
             return Err(Fail::conflict(format!(
@@ -1356,14 +1372,14 @@ fn existing_named(lv: &Lv, name: &str, want: Option<u64>) -> Res<Message> {
         }
     }
     info!("{name}: returning existing volume {}", lv.name);
-    let mut m = export_or_existing(&lv.name, &lv.tags)?;
+    let mut m = export_or_existing(&lv.name, &lv.tags, client)?;
     m.existing = true;
     Ok(m)
 }
 
 /// Under OPS: `?base=` matched `lv`. A sealed base comes back unexported;
 /// an unsealed one exported, for filling.
-fn existing_base(lv: &Lv, image: &str, want: Option<u64>) -> Res<Message> {
+fn existing_base(lv: &Lv, image: &str, want: Option<u64>, client: Ipv4Addr) -> Res<Message> {
     if let Some(w) = want {
         if lv.bytes < w {
             return Err(Fail::conflict(format!(
@@ -1377,7 +1393,7 @@ fn existing_base(lv: &Lv, image: &str, want: Option<u64>) -> Res<Message> {
         return Ok(Message::sealed_base(lv, image));
     }
     info!("{image}: returning unsealed base {}", lv.name);
-    let mut m = export_or_existing(&lv.name, &lv.tags)?;
+    let mut m = export_or_existing(&lv.name, &lv.tags, client)?;
     m.existing = true;
     m.base = Some(image.to_string());
     m.sealed = Some(false);
@@ -1441,21 +1457,47 @@ fn version_info() -> Version {
     }
 }
 
-/// Under OPS: make the LV, export it on a free port and tag it with
-/// `abe_port=<port>` plus `tags`. If anything after lvcreate fails the LV
-/// is removed again, so a failed create leaves nothing behind.
-fn create_and_export(id: &str, size: &str, raw: bool, tags: &[String]) -> Res<(Message, u16)> {
+/// Under OPS: make the LV, export it on a free port open to `client` and
+/// tag it with `abe_port=<port>`, `abe_client=<client>` plus `tags`. If
+/// anything after lvcreate fails the LV is removed again, so a failed
+/// create leaves nothing behind.
+fn create_and_export(
+    id: &str,
+    size: &str,
+    raw: bool,
+    tags: &[String],
+    client: Ipv4Addr,
+) -> Res<(Message, u16)> {
     create_lv(id, size, raw).map_err(Fail::ctx("create_lv"))?;
-    export_new(id, tags).inspect_err(|_| rollback_lv(id))
+    export_new(id, tags, client).inspect_err(|_| rollback_lv(id))
 }
 
-/// Under OPS, for an LV that was just created: pick a port, export, tag.
-/// configfs is cleaned up on failure; the LV is the caller's to roll back.
-fn export_new(id: &str, tags: &[String]) -> Res<(Message, u16)> {
+/// Under OPS: export `id` on `port` and open the port to `client`. If
+/// the fence cannot be opened the export is torn down again: a volume
+/// nobody can reach is worse than an error.
+fn export_to(id: &str, port: u16, client: Ipv4Addr) -> Result<Message> {
+    info!("exporting {id} on {port} for {client}");
+    let mut m = export(id, port)?;
+    if let Err(e) = fence_open(client, port) {
+        warn!("cannot open {port} to {client}: {e}; unexporting {id}");
+        if let Err(e2) = remove_export(id) {
+            warn!("cleanup of {id} failed too: {e2}");
+        }
+        return Err(Error::other(format!("fence: {e}")));
+    }
+    m.client = Some(client.to_string());
+    Ok(m)
+}
+
+/// Under OPS, for an LV that was just created: pick a port, export, open
+/// it to `client`, tag. configfs is cleaned up on failure; the LV is the
+/// caller's to roll back.
+fn export_new(id: &str, tags: &[String], client: Ipv4Addr) -> Res<(Message, u16)> {
     let port = pick_port()?;
-    let m = export(id, port).map_err(Fail::ctx("export"))?;
+    let m = export_to(id, port, client).map_err(Fail::ctx("export"))?;
     let mut add = tags.to_vec();
     add.push(format!("{TAG_PORT}={port}"));
+    add.push(format!("{TAG_CLIENT}={client}"));
     if let Err(e) = retag(id, &[], &add) {
         if let Err(e2) = remove_export(id) {
             warn!("could not unexport {id} after a tagging failure: {e2}");
@@ -1487,26 +1529,38 @@ fn rollback_lv(id: &str) {
     }
 }
 
-/// Under OPS: export `id` if it is not already, record the port, and
-/// return the connect reply either way (GET /id and re-export).
-fn export_or_existing(id: &str, tags: &[String]) -> Res<Message> {
+/// Under OPS: export `id` if it is not already, open its port to
+/// `client` (moving it away from whoever had it), record both, and
+/// return the connect reply (GET /id and named/base retries).
+fn export_or_existing(id: &str, tags: &[String], client: Ipv4Addr) -> Res<Message> {
     if has_tag(tags, TAG_SEALED) {
         return Err(Fail::conflict(format!("{id} is a sealed base; clone it")));
     }
-    if let Some(svc) = existing_export(id) {
-        info!("{id} already exported on port {svc}");
-        if let Ok(p) = svc.parse::<u16>() {
-            if let Err(e) = set_port_tag(id, tags, p) {
-                warn!("could not record port {p} on {id}: {e}");
-            }
+    let (m, port) = match existing_export(id) {
+        Some(svc) => {
+            info!("{id} already exported on port {svc}; fencing it to {client}");
+            let port = svc.parse::<u16>().map_err(|e| {
+                Fail::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{id}: trsvcid {svc:?}: {e}"),
+                )
+            })?;
+            fence_open(client, port).map_err(Fail::ctx("fence"))?;
+            let mut m = Message::exported(id, &svc);
+            m.client = Some(client.to_string());
+            (m, port)
         }
-        return Ok(Message::exported(id, &svc));
-    }
-    let port = pick_port()?;
-    let m = export(id, port).map_err(Fail::ctx("export"))?;
-    // The export is up; the tag only matters for the next restart.
-    if let Err(e) = set_port_tag(id, tags, port) {
-        warn!("could not record port {port} on {id}: {e}");
+        None => {
+            let port = pick_port()?;
+            (
+                export_to(id, port, client).map_err(Fail::ctx("export"))?,
+                port,
+            )
+        }
+    };
+    // The export is up; the tags only matter for the next restart.
+    if let Err(e) = record_export(id, tags, port, Some(client)) {
+        warn!("could not record port {port} and client {client} on {id}: {e}");
     }
     Ok(m)
 }
@@ -1668,8 +1722,12 @@ fn parse_fio(json: &str, bs: &str, iodepth: u32) -> Option<Perf> {
 }
 
 /// GET /id/<id>: (re-)export an existing volume. Idempotent.
-async fn attach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiError> {
-    info!("attach id is {}", id);
+async fn attach(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    EP(id): EP<String>,
+) -> std::result::Result<Json<Message>, ApiError> {
+    let client = client_ip(peer).map_err(Fail::into_api)?;
+    info!("attach id is {id} for {client}");
     run_blocking(move || {
         with_ops(|| {
             let lvs = list_lvs().map_err(Fail::ctx("lvs"))?;
@@ -1677,7 +1735,7 @@ async fn attach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiErr
                 .iter()
                 .find(|l| l.name == id)
                 .ok_or_else(|| Fail::not_found(&id))?;
-            export_or_existing(&id, &lv.tags)
+            export_or_existing(&id, &lv.tags, client)
         })
     })
     .await
@@ -1763,17 +1821,19 @@ async fn utilization() -> std::result::Result<Json<Utilization>, ApiError> {
 /// of <id> (a thin snapshot: it shares the origin's blocks until either side
 /// writes) and export it. The origin may be any thin volume in abe's pool.
 async fn clone_volume(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     EP(origin): EP<String>,
     Query(p): Query<CloneParams>,
 ) -> std::result::Result<Json<CloneReply>, ApiError> {
-    info!("clone of {origin}");
-    run_blocking(move || with_ops(|| clone_locked(&origin, &p)))
+    let client = client_ip(peer).map_err(Fail::into_api)?;
+    info!("clone of {origin} for {client}");
+    run_blocking(move || with_ops(|| clone_locked(&origin, &p, client)))
         .await
         .map(Json)
 }
 
 /// Under OPS: the whole of /clone (no fio runs on a clone).
-fn clone_locked(origin: &str, p: &CloneParams) -> Res<CloneReply> {
+fn clone_locked(origin: &str, p: &CloneParams, client: Ipv4Addr) -> Res<CloneReply> {
     if let Some(n) = &p.name {
         if !valid_tag_value(n) {
             return Err(Fail::bad_request(format!(
@@ -1785,7 +1845,7 @@ fn clone_locked(origin: &str, p: &CloneParams) -> Res<CloneReply> {
     if let Some(name) = &p.name {
         // A retry: the clone exists (even if its origin is gone by now).
         if let Some(lv) = find_tagged(&lvs, &format!("{TAG_NAME}={name}")) {
-            let export = existing_named(lv, name, p.bytes)?;
+            let export = existing_named(lv, name, p.bytes, client)?;
             let n = layers(&lvs, &lv.name);
             return Ok(CloneReply {
                 bytes: lv.bytes,
@@ -1829,7 +1889,7 @@ fn clone_locked(origin: &str, p: &CloneParams) -> Res<CloneReply> {
     let tags: Vec<String> = p.name.iter().map(|n| format!("{TAG_NAME}={n}")).collect();
     let (export, _port) = strip_inherited_tags(&id)
         .map_err(Fail::ctx("lvchange tags"))
-        .and_then(|_| export_new(&id, &tags))
+        .and_then(|_| export_new(&id, &tags, client))
         .inspect_err(|_| rollback_lv(&id))?;
     let bytes = export.bytes.unwrap_or(grow_to.unwrap_or(src.bytes));
     Ok(CloneReply {
@@ -3480,5 +3540,23 @@ table inet abe {
         )
         .unwrap();
         assert_eq!(old.client, None);
+    }
+
+    #[test]
+    fn client_ip_is_ipv4_only() {
+        let v4: SocketAddr = "10.22.0.1:51000".parse().unwrap();
+        assert_eq!(
+            client_ip(v4).unwrap(),
+            "10.22.0.1".parse::<Ipv4Addr>().unwrap()
+        );
+        let mapped: SocketAddr = "[::ffff:10.22.0.1]:51000".parse().unwrap();
+        assert_eq!(
+            client_ip(mapped).unwrap(),
+            "10.22.0.1".parse::<Ipv4Addr>().unwrap()
+        );
+        let v6: SocketAddr = "[fd00::1]:51000".parse().unwrap();
+        let e = client_ip(v6).unwrap_err();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert!(e.error.starts_with("fence needs an IPv4 client address"));
     }
 }
