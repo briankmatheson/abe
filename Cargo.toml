@@ -1,6 +1,6 @@
 [package]
 name = "abe"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "Abe Block Exporter: NVMe-oF/TCP volumes from an LVM thin pool, with an HTTP API"
 license = "GPL-3.0-or-later"
@@ -29,7 +29,7 @@ tokio-rustls = "0.26"
 
 [package.metadata.deb]
 name = "abe-block-exporter"
-revision = "2"
+revision = "1"
 # Debian ships an unrelated SDL game as "abe"; same binary name, so never both.
 # Conflicts only (no Replaces): apt refuses to install over it instead of
 # removing it. Remove the game by hand first.

@@ -278,6 +278,18 @@ if [ -n "$THIN" ]; then
         disconnect "$cid"
         used=$(volume "$cid" | jq -r .used_bytes)
         [ "$used" -lt $((8<<20)) ] || fail "clone $n uses $used bytes"
+        # a retried clone (same name) hands the existing one back, as JSON
+        # a strict reader takes (xdebbied's serde refuses duplicate keys)
+        c2=$($CURL -sf "$URL/clone/$bid?bytes=$((64<<20))&name=e2e-clone-$n") || fail "clone $n again"
+        [ "$(echo "$c2" | jq -r '.id + " " + (.existing|tostring)')" = "$cid true" ] || fail "clone $n again: $c2"
+        python3 -c 'import json,sys
+def nodup(pairs):
+    d={}
+    for k,v in pairs:
+        if k in d: sys.exit("duplicate key %r" % k)
+        d[k]=v
+    return d
+json.loads(sys.stdin.read(), object_pairs_hook=nodup)' <<<"$c2" || fail "clone $n again: duplicate keys in $c2"
     done
     del "$bid"
     for cid in "${cl[@]}"; do
@@ -287,7 +299,7 @@ if [ -n "$THIN" ]; then
         disconnect "$cid"
         del "$cid"
     done
-    pass "bases: $bid filled, sealed, cloned twice, deleted; clones kept the data"
+    pass "bases: $bid filled, sealed, cloned twice (and re-asked), deleted; clones kept the data"
 else
     skip "bases (no thin pool)"
 fi

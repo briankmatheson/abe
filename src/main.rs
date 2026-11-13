@@ -848,6 +848,28 @@ struct CloneReply {
     warning: Option<String>,
 }
 
+impl CloneReply {
+    /// `bytes` is the reply's own field; the flattened export must not
+    /// carry a second one (an existing volume's export does, and a
+    /// strict JSON reader rejects the duplicate key).
+    fn new(
+        mut export: Message,
+        bytes: u64,
+        origin: String,
+        layers: u32,
+        warning: Option<String>,
+    ) -> Self {
+        export.bytes = None;
+        Self {
+            export,
+            bytes,
+            origin,
+            layers,
+            warning,
+        }
+    }
+}
+
 /// Reply of GET /utilization.
 #[derive(Serialize, Debug, PartialEq)]
 struct Utilization {
@@ -1983,13 +2005,13 @@ fn clone_locked(origin: &str, p: &CloneParams, client: Ipv4Addr) -> Res<CloneRep
         if let Some(lv) = find_tagged(&lvs, &format!("{TAG_NAME}={name}")) {
             let export = existing_named(lv, name, p.bytes, client)?;
             let n = layers(&lvs, &lv.name);
-            return Ok(CloneReply {
-                bytes: lv.bytes,
-                origin: lv.origin.clone().unwrap_or_else(|| origin.to_string()),
-                layers: n,
-                warning: layer_warning(&lv.name, n),
+            return Ok(CloneReply::new(
                 export,
-            });
+                lv.bytes,
+                lv.origin.clone().unwrap_or_else(|| origin.to_string()),
+                n,
+                layer_warning(&lv.name, n),
+            ));
         }
     }
     let Some(src) = lvs.iter().find(|l| l.name == origin) else {
@@ -2028,13 +2050,13 @@ fn clone_locked(origin: &str, p: &CloneParams, client: Ipv4Addr) -> Res<CloneRep
         .and_then(|_| export_new(&id, &tags, client))
         .inspect_err(|_| rollback_lv(&id))?;
     let bytes = export.bytes.unwrap_or(grow_to.unwrap_or(src.bytes));
-    Ok(CloneReply {
+    Ok(CloneReply::new(
         export,
         bytes,
-        origin: origin.to_string(),
+        origin.to_string(),
         layers,
         warning,
-    })
+    ))
 }
 
 /// A snapshot may have inherited its origin's abe_* tags (base, sealed,
@@ -2880,6 +2902,31 @@ mod tests {
   fedcba9876543210fedcba9876543210|42949672960|abe|0123456789abcdef0123456789abcdef|0.00|||thin|abe_port=44002|active
   parked|10737418240|abe|[gone]||||thin||
 ";
+
+    #[test]
+    fn clone_reply_of_an_existing_volume_has_one_bytes_key() {
+        // A retried /clone hands back the existing export, whose Message
+        // carries `bytes`; the reply's own `bytes` must be the only one.
+        let mut export = Message::exported("3adcceb82a964a248987646ebc7c8c4b", "23000");
+        export.bytes = Some(21474836480);
+        export.existing = true;
+        let r = CloneReply::new(export, 21474836480, "48744e68".to_string(), 1, None);
+        let js = serde_json::to_string(&r).unwrap();
+        assert_eq!(js.matches("\"bytes\"").count(), 1, "{js}");
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Strict {
+            id: String,
+            port: String,
+            existing: bool,
+            bytes: u64,
+            origin: String,
+            layers: u32,
+        }
+        let s: Strict = serde_json::from_str(&js).unwrap();
+        assert!(s.existing);
+        assert_eq!(s.bytes, 21474836480);
+    }
 
     fn thin(name: &str, origin: Option<&str>) -> Lv {
         Lv {
