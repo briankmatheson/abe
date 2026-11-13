@@ -321,13 +321,13 @@ fi
 
 if have_systemd && [ "$($CURL -sf "$URL/volumes" | jq length)" = 0 ]; then
     mkdir -p "$(dirname "$dropin")"
-    printf '[Service]\nEnvironment=ABE_PORT_MIN=44001\nEnvironment=ABE_PORT_MAX=44002\n' > "$dropin"
+    printf '[Service]\nEnvironment=ABE_PORT_MIN=23000\nEnvironment=ABE_PORT_MAX=23001\n' > "$dropin"
     systemctl daemon-reload; systemctl restart abe; wait_api
     before=$(lvs --noheadings -o lv_name "$VG" | grep -cE '^ *[0-9a-f]{32} *$' || true)
     x1=$(mk "bytes=$((32<<20))&raw=true"); x2=$(mk "bytes=$((32<<20))&raw=true")
     code=$($CURL -s -o "$tmp/x3" -w '%{http_code}' "$URL/configure?bytes=$((32<<20))&raw=true")
     [ "$code" = 503 ] || fail "third create in a 2-port range gave $code: $(cat "$tmp/x3")"
-    grep -q 'no free nvmet port in 44001-44002' "$tmp/x3" || fail "503 body: $(cat "$tmp/x3")"
+    grep -q 'no free nvmet port in 23000-23001' "$tmp/x3" || fail "503 body: $(cat "$tmp/x3")"
     after=$(lvs --noheadings -o lv_name "$VG" | grep -cE '^ *[0-9a-f]{32} *$' || true)
     [ "$after" = $((before + 2)) ] || fail "a third LV was left behind ($before -> $after)"
     del "$(echo "$x1" | jq -r .id)"; del "$(echo "$x2" | jq -r .id)"

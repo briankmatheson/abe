@@ -37,7 +37,7 @@ Put the server certificate, its key and the client CA at
 `/etc/abe/{cert,key,ca}.pem` (or set `ABE_TLS_CERT` / `ABE_TLS_KEY` /
 `ABE_TLS_CA` in `/etc/default/abe`). `README.md`, section "TLS", has the
 openssl commands for a standalone CA. If the host firewall filters
-input, let 443 and the nvmet range 44001:44999 through on the interface
+input, let 443 and the nvmet range 23000:23999 through on the interface
 initiators use; abe's own table (`inet abe`) narrows each port to the
 client that asked for it.
 
@@ -61,9 +61,9 @@ $CURL https://abe-server/configure
 Response (abridged):
 ```json
 {
-  "message": "sudo nvme connect -a 10.23.0.100 -t tcp -s 44001 -n 550e8400e29b41d4a716446655440000",
+  "message": "sudo nvme connect -a 10.23.0.100 -t tcp -s 23000 -n 550e8400e29b41d4a716446655440000",
   "id": "550e8400e29b41d4a716446655440000",
-  "port": "44001",
+  "port": "23000",
   "client": "10.23.0.7"
 }
 ```

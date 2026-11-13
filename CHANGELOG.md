@@ -5,6 +5,19 @@
 The API moves to HTTPS with mutual TLS, and every nvmet port is fenced
 to the address that asked for it.
 
+### Port range 23000-23999; fence keyed on exported ports
+
+- The default nvmet port range moves from 44001-44999 to 23000-23999,
+  outside the kernel's ephemeral range (32768-60999). Override with
+  `ABE_PORT_MIN`/`ABE_PORT_MAX` as before; a volume recorded on an old
+  port is moved into the range at the next re-export (`moved` in the
+  summary) and stays fenced on the old port until then.
+- The fence rejects SYNs to the `ports` set (every exported port) rather
+  than to the configured range, so exports that survive a range change
+  are still fenced. `nft list table inet abe` shows both sets.
+- Firewalls that allowed 44000:44999 need the new range (ufw:
+  `allow in on wg-flock proto tcp from 10.22.0.0/16 to any port 23000:23999`).
+
 ### Fence rules judge SYNs only; port range reserved from ephemeral use
 
 - The reject rules match only bare SYNs. For a local initiator both

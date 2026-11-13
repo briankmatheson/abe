@@ -49,8 +49,8 @@ Configuration is by environment (see `debian/abe.default`, installed as
 | `ABE_TLS_CA` | `/etc/abe/ca.pem` | CA bundle client certificates must chain to |
 | `ABE_NFT` | `nft` on PATH, else `/usr/sbin/nft` | nft binary for the port fence |
 | `ABE_VOL_SIZE` | `10G` | size of a volume made without `?size=`/`?bytes=` |
-| `ABE_PORT_MIN` | `44001` | lowest nvmet TCP port handed to exports |
-| `ABE_PORT_MAX` | `44999` | highest; abe refuses to start unless `1 <= min <= max <= 65535` |
+| `ABE_PORT_MIN` | `23000` | lowest nvmet TCP port handed to exports |
+| `ABE_PORT_MAX` | `23999` | highest; abe refuses to start unless `1 <= min <= max <= 65535` |
 | `ABE_REEXPORT_WAIT` | `90` | seconds startup waits for the underlay address before serving anyway |
 | `ABE_FIO_SECONDS` | `5` | seconds of fio writes on each new volume (0: off) |
 | `ABE_FIO_RAMP` | `3` | seconds of unmeasured fio warm-up before that |
@@ -106,15 +106,19 @@ certificate *and* that source address. abe owns one nftables table:
 
 ```
 table inet abe {
+    set ports {
+        type inet_service
+        comment "nvmet ports exported by abe"
+    }
     set allowed {
         type ipv4_addr . inet_service
         comment "client ip . nvmet port opened by abe"
     }
     chain input {
         type filter hook input priority filter - 10; policy accept;
-        tcp dport 44001-44999  ip saddr . tcp dport @allowed  accept
-        tcp dport 44001-44999  tcp flags & (syn | ack) == syn  reject with tcp reset
-        meta nfproto ipv6  tcp dport 44001-44999  tcp flags & (syn | ack) == syn  reject with tcp reset
+        ip saddr . tcp dport @allowed  accept
+        tcp dport @ports  tcp flags & (syn | ack) == syn  reject with tcp reset
+        meta nfproto ipv6  tcp dport @ports  tcp flags & (syn | ack) == syn  reject with tcp reset
     }
 }
 ```
@@ -122,13 +126,15 @@ table inet abe {
 Only a bare SYN (a new connection attempt) is ever rejected, so an
 established session is not cut when its port is moved to another client
 (it loses access on its next reconnect), and a local initiator — whose
-ephemeral source port may fall inside the range, putting the SYN-ACK
-back to it through this same chain — is never reset. For the same reason
-abe reserves the range from ephemeral use at startup
-(`net.ipv4.ip_local_reserved_ports`), which also stops a local client
-from grabbing a port abe later wants to export on.
+ephemeral source port could land on an exported port, putting the
+SYN-ACK back to it through this same chain — is never reset. abe also
+reserves `ABE_PORT_MIN-ABE_PORT_MAX` from ephemeral use at startup
+(`net.ipv4.ip_local_reserved_ports`), so a local client cannot grab a
+port abe later wants to export on; the default range 23000-23999 is
+outside the kernel's ephemeral range (32768-60999) to begin with.
 
-The range is `ABE_PORT_MIN-ABE_PORT_MAX`. The table goes up before
+`ports` holds every exported port (including one left over from an
+earlier port range), `allowed` who may open each. The table goes up before
 anything is exported (startup fails with exit 4 if nft cannot install
 it) and is **replaced atomically** on every re-export pass, already
 holding every live export. An export is opened right after configfs is
@@ -155,17 +161,17 @@ Ports
 -----
 
 Every export gets its own nvmet port on `ABE_TRADDR`: the **lowest free
-TCP port** in `ABE_PORT_MIN`..`ABE_PORT_MAX` (44001-44999), so the port a
+TCP port** in `ABE_PORT_MIN`..`ABE_PORT_MAX` (23000-23999), so the port a
 delete frees is the next one handed out. Port directories in configfs
-are named after the port number (`ports/44003`); ones made by older
+are named after the port number (`ports/23002`); ones made by older
 versions (`ports/1`, `ports/2`) keep working, since only `addr_trsvcid`
 is consulted. When the range is full, `/configure`, `/clone` and `/id`
-answer `503` with `{"error": "no free nvmet port in 44001-44999 (N
+answer `503` with `{"error": "no free nvmet port in 23000-23999 (N
 exported)"}` and nothing is left behind. Each port is open only to the
 address that asked for it (see "Port fence"); beyond that abe does not
-touch the host firewall, so open 443 and 44001:44999 on the interface
+touch the host firewall, so open 443 and 23000:23999 on the interface
 initiators use, e.g. `ufw allow in on wg-flock proto tcp from
-10.22.0.0/16 to any port 44001:44999`.
+10.22.0.0/16 to any port 23000:23999`.
 
 Exports live only in configfs, so a reboot or a fresh `nvmet` module
 load erases them. **At startup abe exports every volume again**, before

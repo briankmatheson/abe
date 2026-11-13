@@ -55,9 +55,12 @@ What the fence does **not** do:
   port is moved to another client until it reconnects; `GET /id` from
   the new client does not cut the old one. The reason is correctness
   for local initiators: both directions of a local connection pass the
-  input hook, and resetting anything but SYNs resets the SYN-ACK back
-  to an ephemeral port inside the range. abe also reserves the range
-  from ephemeral use (`net.ipv4.ip_local_reserved_ports`).
+  input hook, and resetting anything but SYNs would reset a SYN-ACK
+  back to an ephemeral port that happens to be exported. The default
+  range 23000-23999 is outside the ephemeral range, and abe reserves
+  it anyway (`net.ipv4.ip_local_reserved_ports`).
+- The fence is keyed on exported ports, not the configured range, so a
+  port left over from an earlier range stays fenced after the change.
 - Other base chains on `input` still run (`accept` only ends abe's
   chain); abe never widens another table's policy.
 

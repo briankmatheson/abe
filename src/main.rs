@@ -281,30 +281,41 @@ fn reserved_ports_update(have: &str, min: u16, max: u16) -> Option<String> {
     })
 }
 
-/// The whole `inet abe` table for the port range `min..=max`, with
-/// `elements` already in the set, as one `nft -f` transaction. `destroy`
-/// (nft >= 1.0.7) so a missing table is not an error. `accept` only ends
-/// this chain: other base chains on input still run.
+/// The whole `inet abe` table as one `nft -f` transaction: `ports` holds
+/// every exported nvmet port, `allowed` the `(client, port)` pairs, and
+/// a SYN to an exported port from anyone but its client is reset. The
+/// configured range plays no part here, so an export that survived a
+/// range change stays fenced. `destroy` (nft >= 1.0.7) so a missing
+/// table is not an error. `accept` only ends this chain: other base
+/// chains on input still run.
 ///
 /// Only a bare SYN (a new connection attempt) is ever rejected. For a
 /// local initiator both directions of a connection pass the input hook,
-/// and its ephemeral source port can fall inside the nvmet range, so
-/// without the flags test the SYN-ACK back to it (dport = that ephemeral
-/// port, not in the set) would be reset and the connect would time out.
-/// `reserve_ports` keeps the kernel from handing out those ports too.
-fn fence_script(min: u16, max: u16, elements: &[(Ipv4Addr, u16)]) -> String {
-    let elems = if elements.is_empty() {
-        String::new()
-    } else {
-        let list: Vec<String> = elements
-            .iter()
-            .map(|(ip, port)| format!("{ip} . {port}"))
-            .collect();
-        format!("        elements = {{ {} }}", list.join(", "))
+/// and its ephemeral source port could land on an exported port, so
+/// without the flags test the SYN-ACK back to it (dport = that port,
+/// not in `allowed`) would be reset and the connect would time out.
+/// `reserve_ports` keeps the kernel from handing out the range too.
+fn fence_script(ports: &[u16], elements: &[(Ipv4Addr, u16)]) -> String {
+    let set = |items: Vec<String>| {
+        if items.is_empty() {
+            String::new()
+        } else {
+            format!("        elements = {{ {} }}", items.join(", "))
+        }
     };
+    let ports = set(ports.iter().map(|p| p.to_string()).collect());
+    let elems = set(elements
+        .iter()
+        .map(|(ip, port)| format!("{ip} . {port}"))
+        .collect());
     [
         "destroy table inet abe".to_string(),
         "table inet abe {".to_string(),
+        "    set ports {".to_string(),
+        "        type inet_service".to_string(),
+        "        comment \"nvmet ports exported by abe\"".to_string(),
+        ports,
+        "    }".to_string(),
         "    set allowed {".to_string(),
         "        type ipv4_addr . inet_service".to_string(),
         "        comment \"client ip . nvmet port opened by abe\"".to_string(),
@@ -312,11 +323,10 @@ fn fence_script(min: u16, max: u16, elements: &[(Ipv4Addr, u16)]) -> String {
         "    }".to_string(),
         "    chain input {".to_string(),
         "        type filter hook input priority filter - 10; policy accept;".to_string(),
-        format!("        tcp dport {min}-{max}  ip saddr . tcp dport @allowed  accept"),
-        format!("        tcp dport {min}-{max}  tcp flags & (syn | ack) == syn  reject with tcp reset"),
-        format!(
-            "        meta nfproto ipv6  tcp dport {min}-{max}  tcp flags & (syn | ack) == syn  reject with tcp reset"
-        ),
+        "        ip saddr . tcp dport @allowed  accept".to_string(),
+        "        tcp dport @ports  tcp flags & (syn | ack) == syn  reject with tcp reset".to_string(),
+        "        meta nfproto ipv6  tcp dport @ports  tcp flags & (syn | ack) == syn  reject with tcp reset"
+            .to_string(),
         "    }".to_string(),
         "}".to_string(),
     ]
@@ -326,19 +336,19 @@ fn fence_script(min: u16, max: u16, elements: &[(Ipv4Addr, u16)]) -> String {
     .collect()
 }
 
-/// The table with an empty set.
+/// The table with empty sets.
 #[cfg(test)]
-fn fence_script_for_range(min: u16, max: u16) -> String {
-    fence_script(min, max, &[])
+fn fence_script_empty() -> String {
+    fence_script(&[], &[])
 }
 
-/// Replace the `inet abe` table atomically with one that allows exactly
-/// `elements`. Under OPS when exports exist.
-fn fence_install(elements: &[(Ipv4Addr, u16)]) -> Result<()> {
-    let (min, max) = port_bounds();
-    nft(&["-f", "-"], Some(&fence_script(min, max, elements)))?;
+/// Replace the `inet abe` table atomically with one that fences exactly
+/// `ports` and allows exactly `elements`. Under OPS when exports exist.
+fn fence_install(ports: &[u16], elements: &[(Ipv4Addr, u16)]) -> Result<()> {
+    nft(&["-f", "-"], Some(&fence_script(ports, elements)))?;
     info!(
-        "fence: table inet abe installed for {min}-{max} with {} element(s)",
+        "fence: table inet abe installed with {} exported port(s), {} open",
+        ports.len(),
         elements.len()
     );
     Ok(())
@@ -362,8 +372,47 @@ fn fence_open(ip: Ipv4Addr, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Under OPS: drop every element for `port`. A port that was not open,
-/// or no table at all, is not an error.
+/// `port` is in the `ports` set (rejecting everyone not in `allowed`).
+/// Adding an element that is already there is not an error.
+fn fence_mark_exported(port: u16) -> Result<()> {
+    nft(
+        &[
+            "add",
+            "element",
+            "inet",
+            "abe",
+            "ports",
+            &format!("{{ {port} }}"),
+        ],
+        None,
+    )
+    .map(drop)
+}
+
+/// Under OPS: `port` is no longer exported; drop it from both sets.
+fn fence_forget_port(port: u16) -> Result<()> {
+    fence_close_port(port)?;
+    match nft(
+        &[
+            "delete",
+            "element",
+            "inet",
+            "abe",
+            "ports",
+            &format!("{{ {port} }}"),
+        ],
+        None,
+    ) {
+        Ok(_) => Ok(()),
+        // not in the set, or no table: nothing to forget
+        Err(e) if e.to_string().contains("No such file or directory") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Under OPS: `port` rejects everyone — it is in `ports` and every
+/// `allowed` element for it is dropped. A port that was not open is not
+/// an error; no table at all is a warning (GET /reexport rebuilds it).
 fn fence_close_port(port: u16) -> Result<()> {
     let open = match nft(&["-j", "list", "set", "inet", "abe", "allowed"], None) {
         Ok(json) => parse_nft_set_json(&json)?,
@@ -373,6 +422,7 @@ fn fence_close_port(port: u16) -> Result<()> {
         }
         Err(e) => return Err(e),
     };
+    fence_mark_exported(port)?;
     for (p, ip) in open {
         if p != port {
             continue;
@@ -909,11 +959,12 @@ fn fence_rebuild() -> Result<FenceSync> {
         Ok(l) => l,
         Err(e) => {
             warn!("fence: lvs failed ({e}); installing an empty fence");
-            fence_install(&[])?;
+            fence_install(&[], &[])?;
             return Ok(sync);
         }
     };
     let mut keep = Vec::new();
+    let mut ports = Vec::new();
     for lv in lvs
         .iter()
         .filter(|l| is_volume_id(&l.name) && !has_tag(&l.tags, TAG_SEALED))
@@ -937,13 +988,14 @@ fn fence_rebuild() -> Result<FenceSync> {
                 None
             }
         });
+        ports.push(port);
         match client {
             Some(ip) => keep.push((ip, port)),
             None => sync.closed.push(id.clone()),
         }
         sync.already.push((id.clone(), port, client));
     }
-    fence_install(&keep)?;
+    fence_install(&ports, &keep)?;
     for (id, port, client) in &sync.already {
         if let Err(e) = lvs
             .iter()
@@ -2337,7 +2389,7 @@ fn remove_export(id: &str) -> Result<Option<String>> {
             // Fence first: nobody reaches a port that is being torn down,
             // and a stale element can never outlive its export.
             if let Some(port) = svc.as_deref().and_then(|s| s.parse::<u16>().ok()) {
-                if let Err(e) = fence_close_port(port) {
+                if let Err(e) = fence_forget_port(port) {
                     warn!("could not close {port} in the fence: {e}");
                 }
             }
@@ -2421,7 +2473,7 @@ fn port_range() -> std::result::Result<(u16, u16), String> {
                 .map_err(|e| format!("{k}={s:?} is not a port number (1-65535): {e}")),
         }
     };
-    let (min, max) = (get("ABE_PORT_MIN", 44001)?, get("ABE_PORT_MAX", 44999)?);
+    let (min, max) = (get("ABE_PORT_MIN", 23000)?, get("ABE_PORT_MAX", 23999)?);
     if min == 0 {
         return Err("ABE_PORT_MIN must be at least 1".to_string());
     }
@@ -2433,7 +2485,7 @@ fn port_range() -> std::result::Result<(u16, u16), String> {
 
 /// `port_range()` after main has validated it.
 fn port_bounds() -> (u16, u16) {
-    port_range().unwrap_or((44001, 44999))
+    port_range().unwrap_or((23000, 23999))
 }
 
 /// The lowest port in `min..=max` that is not in `used`.
@@ -3335,7 +3387,6 @@ mod tests {
 
     #[test]
     fn client_verifier_wants_our_ca() {
-        use rustls::server::danger::ClientCertVerifier;
         let client = read_pem_certs(&cert("client.pem")).unwrap().remove(0);
         let now = rustls::pki_types::UnixTime::now();
         let ours = client_verifier(&cert("ca.pem")).unwrap();
@@ -3430,15 +3481,19 @@ mod tests {
     const FENCE_SCRIPT: &str = "\
 destroy table inet abe
 table inet abe {
+    set ports {
+        type inet_service
+        comment \"nvmet ports exported by abe\"
+    }
     set allowed {
         type ipv4_addr . inet_service
         comment \"client ip . nvmet port opened by abe\"
     }
     chain input {
         type filter hook input priority filter - 10; policy accept;
-        tcp dport 44001-44999  ip saddr . tcp dport @allowed  accept
-        tcp dport 44001-44999  tcp flags & (syn | ack) == syn  reject with tcp reset
-        meta nfproto ipv6  tcp dport 44001-44999  tcp flags & (syn | ack) == syn  reject with tcp reset
+        ip saddr . tcp dport @allowed  accept
+        tcp dport @ports  tcp flags & (syn | ack) == syn  reject with tcp reset
+        meta nfproto ipv6  tcp dport @ports  tcp flags & (syn | ack) == syn  reject with tcp reset
     }
 }
 ";
@@ -3482,27 +3537,28 @@ table inet abe {
 
     #[test]
     fn fence_script_golden() {
-        assert_eq!(fence_script_for_range(44001, 44999), FENCE_SCRIPT);
+        assert_eq!(fence_script_empty(), FENCE_SCRIPT);
         let with = fence_script(
-            44001,
-            44999,
+            &[23000, 23001, 44001],
             &[
-                ("10.22.0.1".parse().unwrap(), 44001),
-                ("10.23.0.2".parse().unwrap(), 44002),
+                ("10.22.0.1".parse().unwrap(), 23000),
+                ("10.23.0.2".parse().unwrap(), 23001),
             ],
         );
         assert_eq!(
             with,
-            FENCE_SCRIPT.replace(
-                "        comment \"client ip . nvmet port opened by abe\"\n",
-                "        comment \"client ip . nvmet port opened by abe\"\n        elements = { 10.22.0.1 . 44001, 10.23.0.2 . 44002 }\n"
-            )
+            FENCE_SCRIPT
+                .replace(
+                    "        comment \"nvmet ports exported by abe\"\n",
+                    "        comment \"nvmet ports exported by abe\"\n        elements = { 23000, 23001, 44001 }\n",
+                )
+                .replace(
+                    "        comment \"client ip . nvmet port opened by abe\"\n",
+                    "        comment \"client ip . nvmet port opened by abe\"\n        elements = { 10.22.0.1 . 23000, 10.23.0.2 . 23001 }\n",
+                )
         );
     }
 
-    /// The script really loads: run nft in a private user+network
-    /// namespace when the box allows that (no root needed); skipped
-    /// otherwise.
     #[test]
     fn fence_script_loads_in_a_namespace() {
         let nft = ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"]
@@ -3519,7 +3575,7 @@ table inet abe {
             eprintln!("skipped: unshare -r -n not permitted here");
             return;
         }
-        let script = fence_script(44001, 44999, &[("10.22.0.1".parse().unwrap(), 44001)]);
+        let script = fence_script(&[44001], &[("10.22.0.1".parse().unwrap(), 44001)]);
         let one = |args: &[&str], stdin: &str| -> (bool, String) {
             let mut c = Command::new("unshare")
                 .args(["-r", "-n", "sh", "-c"])
@@ -3542,7 +3598,10 @@ table inet abe {
         };
         // install twice (destroy of an existing table) then open one more
         let (ok, out) = one(
-            &["add element inet abe allowed '{ 10.23.0.2 . 44002 }'"],
+            &[&format!(
+                "add element inet abe ports '{{ 44002 }}' && {nft} add element inet abe ports '{{ 44002 }}' \
+                 && {nft} add element inet abe allowed '{{ 10.23.0.2 . 44002 }}'"
+            )],
             &format!("{script}{script}"),
         );
         assert!(ok, "{out}");
@@ -3556,11 +3615,17 @@ table inet abe {
             Some("10.23.0.2")
         );
         let (ok, out) = one(
-            &["delete element inet abe allowed '{ 10.22.0.1 . 44001 }'"],
+            &[&format!(
+                "delete element inet abe allowed '{{ 10.22.0.1 . 44001 }}' \
+                 && {nft} delete element inet abe ports '{{ 44001 }}'"
+            )],
             &script,
         );
         assert!(ok, "{out}");
         assert!(parse_nft_set_json(&out).unwrap().is_empty());
+        // deleting a port that is not in the set is the error fence_forget_port tolerates
+        let (ok, out) = one(&["delete element inet abe ports '{ 23000 }'"], &script);
+        assert!(!ok && out.contains("No such file or directory"), "{out}");
     }
 
     #[test]

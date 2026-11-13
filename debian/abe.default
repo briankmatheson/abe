@@ -33,10 +33,10 @@
 # asked for it (table inet abe).
 #ABE_NFT=/usr/sbin/nft
 
-# nvmet TCP port range for exports (defaults: 44001-44999). Each export takes
+# nvmet TCP port range for exports (defaults: 23000-23999). Each export takes
 # the lowest free port; /configure answers 503 when the range is full.
-#ABE_PORT_MIN=44001
-#ABE_PORT_MAX=44999
+#ABE_PORT_MIN=23000
+#ABE_PORT_MAX=23999
 
 # Seconds startup waits for every volume to be exported again (default: 90)
 # while the underlay address is still missing; after that abe serves anyway
