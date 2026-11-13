@@ -15,8 +15,10 @@
 SHELL    := /bin/bash
 CARGO    ?= cargo
 VERSION  := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+REVISION := $(shell sed -n 's/^revision = "\(.*\)"/\1/p' Cargo.toml | head -1)
+REVISION := $(if $(REVISION),$(REVISION),1)
 ARCH     := $(shell dpkg --print-architecture 2>/dev/null || echo amd64)
-DEB      := target/debian/abe-block-exporter_$(VERSION)-1_$(ARCH).deb
+DEB      := target/debian/abe-block-exporter_$(VERSION)-$(REVISION)_$(ARCH).deb
 HOSTS    ?=
 SSH_USER ?= $(USER)
 
@@ -26,7 +28,8 @@ SSH_USER ?= $(USER)
 VERIFY := . /etc/default/abe 2>/dev/null; \
   if [ x$${ABE_TLS:-on} = xoff ]; then CURL=curl; S=http; \
   else CURL='sudo curl --cacert '$${ABE_TLS_CA:-/etc/abe/ca.pem}' --cert '$${ABE_TLS_CERT:-/etc/abe/cert.pem}' --key '$${ABE_TLS_KEY:-/etc/abe/key.pem}; S=https; fi; \
-  $$CURL -sf $$S://$$(echo $${ABE_LISTEN:-127.0.0.1:443} | sed s/0.0.0.0/127.0.0.1/)/version; echo
+  U=$$S://$$(echo $${ABE_LISTEN:-127.0.0.1:443} | sed s/0.0.0.0/127.0.0.1/)/version; \
+  $$CURL -sf $$U && echo || { echo '!! abe is not answering' $$U '-- see: sudo journalctl -u abe -n 20 and /etc/default/abe'; false; }
 REMOTE_VERIFY = $(subst $$,\$$,$(VERIFY))
 
 .DEFAULT_GOAL := build

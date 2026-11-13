@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.1
+
+- Startup checks `ABE_LISTEN` and loads the TLS material **before**
+  touching nvmet, the port reservation or the nftables fence, so a bad
+  path in `/etc/default/abe` exits 3 with nothing changed on the host.
+- `blkdiscard --force`: util-linux >= 2.38 refuses to discard a device
+  carrying a signature, which made every GPT volume's `/clone` and
+  `/seal` trim report `trimmed: false`.
+- `make install` / `make deploy` reinstall even at the same version and
+  keep the local `/etc/default/abe` (`Dpkg::Options::=--force-confold`);
+  the package revision comes from `[package.metadata.deb] revision`.
+  `make deploy` says plainly when the remote `/version` check fails.
+
 ## 0.5.0
 
 The API moves to HTTPS with mutual TLS, and every nvmet port is fenced

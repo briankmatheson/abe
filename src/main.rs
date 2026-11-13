@@ -2744,6 +2744,11 @@ async fn main() {
         }
     };
 
+    // Listen address and TLS material are checked first: a typo in
+    // /etc/default/abe fails here, before nvmet, the fence or the port
+    // reservation have been touched.
+    let listen = listen_config();
+
     if let Err(e) = ensure_configfs_mounted().and_then(|_| ensure_nvmet_present()) {
         error!("cannot set up nvmet: {e}");
         std::process::exit(1);
@@ -2787,13 +2792,20 @@ async fn main() {
         nft_bin().display(),
         tls_enabled()
     );
-    serve(app).await;
+    serve(app, listen).await;
 }
 
-/// Bind ABE_LISTEN and serve `app` over mutual TLS (or plain HTTP with
-/// ABE_TLS=off) until the process ends. Handlers get the peer address in
-/// both modes.
-async fn serve(app: Router) {
+/// What `serve` needs, resolved by `listen_config` before startup side
+/// effects: the bound address and the TLS server config (None = ABE_TLS=off).
+struct Listen {
+    addr: SocketAddr,
+    tls: Option<Arc<rustls::ServerConfig>>,
+}
+
+/// Parse ABE_LISTEN and load the TLS material (ABE_TLS=on); exits 2 on a bad
+/// address and 3 when the cert/key/CA cannot be loaded, having changed
+/// nothing on the host.
+fn listen_config() -> Listen {
     let addr: SocketAddr = match listen_addr().parse() {
         Ok(a) => a,
         Err(e) => {
@@ -2813,6 +2825,14 @@ async fn serve(app: Router) {
         warn!("ABE_TLS=off: the API is served over plain HTTP without authentication");
         None
     };
+    Listen { addr, tls }
+}
+
+/// Serve `app` on the address from `listen_config` over mutual TLS (or plain
+/// HTTP with ABE_TLS=off) until the process ends. Handlers get the peer
+/// address in both modes.
+async fn serve(app: Router, listen: Listen) {
+    let Listen { addr, tls } = listen;
     let scheme = if tls.is_some() { "https" } else { "http" };
     let shown = if addr.ip().is_unspecified() {
         get_if_addrs()
