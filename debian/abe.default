@@ -22,3 +22,11 @@
 # the lowest free port; /configure answers 503 when the range is full.
 #ABE_PORT_MIN=44001
 #ABE_PORT_MAX=44999
+
+# Seconds startup waits for every volume to be exported again (default: 90)
+# while the underlay address is still missing; after that abe serves anyway
+# and keeps retrying in the background.
+#ABE_REEXPORT_WAIT=90
+
+# nvmet configfs root (default: /sys/kernel/config/nvmet). For tests only.
+#ABE_NVMET_PATH=/sys/kernel/config/nvmet
