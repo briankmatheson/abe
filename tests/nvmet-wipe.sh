@@ -3,8 +3,9 @@
 # every subsystem from its port, remove the port if it is then empty, disable
 # and remove the namespaces, remove the subsystem. By default only abe's
 # subsystems (named by a 32-hex volume id) are touched; --all takes down
-# every subsystem and port. Needs root. abe should be stopped first, or it
-# will not notice (its re-export pass runs at startup and on GET /reexport).
+# every subsystem and port, and abe's nftables fence (table inet abe) with
+# them. Needs root. abe should be stopped first, or it will not notice
+# (its re-export pass runs at startup and on GET /reexport).
 #   sudo tests/nvmet-wipe.sh [--all]
 set -euo pipefail
 root=${ABE_NVMET_PATH:-/sys/kernel/config/nvmet}
@@ -35,4 +36,7 @@ for sub in "$root"/subsystems/*; do
     rmdir "$sub"
     n=$((n + 1))
 done
+if [ "$all" = 1 ]; then
+    nft destroy table inet abe 2>/dev/null || true
+fi
 echo "removed $n subsystem(s); ports left: $(ls "$root/ports" | tr '\n' ' ')"
