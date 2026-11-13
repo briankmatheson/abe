@@ -54,8 +54,8 @@ deb:
 
 $(DEB): deb
 
-# The package Conflicts with Debian's unrelated "abe" (an SDL game), so apt
-# removes that one if it is installed.
+# Conflicts with Debian's unrelated "abe" (an SDL game): apt errors out if
+# that is installed. Remove it yourself (apt remove abe abe-data) first.
 install: $(DEB)
 	sudo apt install -y ./$(DEB)
 

@@ -23,8 +23,9 @@ chrono = { version = "0.4", features = ["serde"] }
 [package.metadata.deb]
 name = "abe-block-exporter"
 # Debian ships an unrelated SDL game as "abe"; same binary name, so never both.
+# Conflicts only (no Replaces): apt refuses to install over it instead of
+# removing it. Remove the game by hand first.
 conflicts = "abe"
-replaces = "abe"
 maintainer = "Brian Matheson <brian@brianmatheson.com>"
 copyright = "2024, Brian Matheson <brian@brianmatheson.com>"
 section = "admin"
