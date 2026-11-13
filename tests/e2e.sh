@@ -9,7 +9,13 @@
 # port reuse, concurrency, name idempotency, trim, GPT intact, bases and
 # seal, re-export across a stop/wipe/start, and the port range running out.
 set -euo pipefail
+# Default to the address abe is bound to on this host (ABE_LISTEN in
+# /etc/default/abe), else the loopback.
+if [ -z "${ABE_URL:-}" ] && [ -r /etc/default/abe ]; then
+    ABE_URL=$(sed -n 's/^ABE_LISTEN=\(.*\)/http:\/\/\1/p' /etc/default/abe | tail -1)
+fi
 URL=${ABE_URL:-http://127.0.0.1:80}
+modprobe nvme-tcp 2>/dev/null || true   # the initiator side; abe loads the target side
 FIO_BS=${E2E_FIO_BS:-4k}
 HERE=$(cd "$(dirname "$0")" && pwd)
 pass() { echo "  ok  $*"; }
