@@ -12,6 +12,10 @@
   keep the local `/etc/default/abe` (`Dpkg::Options::=--force-confold`);
   the package revision comes from `[package.metadata.deb] revision`.
   `make deploy` says plainly when the remote `/version` check fails.
+- (0.5.1-2) Upgrading the package restarts abe if it was running: `prerm` stops it
+  (as before) and notes that it was active, `postinst` starts the new
+  one. A plain `apt install ./abe-block-exporter_*.deb` used to leave
+  abe stopped, exports and fence down, until someone noticed.
 
 ## 0.5.0
 

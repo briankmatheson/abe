@@ -17,6 +17,14 @@ EOF
         
         # Reload systemd
         systemctl daemon-reload || true
+
+        # Upgrade of a running abe: start the new one (prerm stopped it).
+        if [ -e /run/abe.was-active ]; then
+            rm -f /run/abe.was-active
+            echo "Starting ABE service..."
+            systemctl start abe.service || echo "abe did not start: journalctl -u abe -n 20" >&2
+            exit 0
+        fi
         
         echo ""
         echo "Before starting ABE (systemctl start abe), make sure you have:"

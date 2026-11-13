@@ -3,6 +3,12 @@ set -e
 
 case "$1" in
     remove|upgrade|deconfigure)
+        # Remember whether abe was running so postinst can bring the new
+        # version up again (an upgrade must not leave the exports down).
+        rm -f /run/abe.was-active
+        if [ "$1" = upgrade ] && systemctl is-active --quiet abe.service; then
+            touch /run/abe.was-active
+        fi
         echo "Stopping ABE service..."
         systemctl stop abe.service || true
         ;;

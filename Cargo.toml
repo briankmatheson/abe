@@ -29,6 +29,7 @@ tokio-rustls = "0.26"
 
 [package.metadata.deb]
 name = "abe-block-exporter"
+revision = "2"
 # Debian ships an unrelated SDL game as "abe"; same binary name, so never both.
 # Conflicts only (no Replaces): apt refuses to install over it instead of
 # removing it. Remove the game by hand first.
