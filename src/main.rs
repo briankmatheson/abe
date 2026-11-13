@@ -122,6 +122,9 @@ struct ConfigureParams {
     /// idempotency key: if a volume tagged `abe_name=<name>` exists it is
     /// returned (with `existing: true`) instead of a new one being made
     name: Option<String>,
+    /// make (or return) the base volume for this image: raw, no fio,
+    /// one per image; see /seal
+    base: Option<String>,
 }
 
 type ApiError = (StatusCode, Json<ErrorMessage>);
@@ -214,9 +217,33 @@ struct Message {
     /// what fio measured on a freshly created volume (/configure only)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     perf: Option<Perf>,
-    /// true when `?name=` matched a volume that already existed
+    /// true when `?name=` or `?base=` matched a volume that already existed
     #[serde(default)]
     existing: bool,
+    /// base volumes only: the image this is the base for
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
+    /// base volumes only: sealed bases are never exported (`port` is empty)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed: Option<bool>,
+}
+
+/// Reply of GET /seal/<id>.
+#[derive(Serialize)]
+struct SealReply {
+    id: String,
+    base: String,
+    sealed: bool,
+    bytes: u64,
+}
+
+/// Reply of GET /version.
+#[derive(Serialize)]
+struct Version {
+    version: &'static str,
+    /// what this abe can do, for callers that must also work with older
+    /// ones: reexport, ports, name, trim, and (with a thin pool) base, clone
+    features: Vec<&'static str>,
 }
 
 impl Message {
@@ -232,6 +259,24 @@ impl Message {
             bytes: lv_bytes(id),
             perf: None,
             existing: false,
+            base: None,
+            sealed: None,
+        }
+    }
+
+    /// The reply for a sealed base: nothing to connect to.
+    fn sealed_base(lv: &Lv, image: &str) -> Message {
+        Message {
+            message: format!("{} is a sealed base; clone it", lv.name),
+            id: lv.name.clone(),
+            port: String::new(),
+            traddr: advertised_traddr(),
+            nqn: lv.name.clone(),
+            bytes: Some(lv.bytes),
+            perf: None,
+            existing: true,
+            base: Some(image.to_string()),
+            sealed: Some(true),
         }
     }
 }
@@ -307,6 +352,12 @@ struct Volume {
     /// set when `layers` is over MAX_SNAPSHOT_LAYERS
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<String>,
+    /// the image this volume is the base for (`abe_base` tag)
+    base: Option<String>,
+    /// a sealed base: never exported, clone-only
+    sealed: bool,
+    /// the caller's name for it (`abe_name` tag)
+    name: Option<String>,
 }
 
 /// More snapshot layers than this under one volume earns a warning.
@@ -699,33 +750,51 @@ async fn configure(
         (None, Some(s)) if !s.is_empty() => s,
         _ => default_vol_size(),
     };
-    let raw = p.raw.unwrap_or(false);
-    if let Some(n) = &p.name {
-        if !valid_tag_value(n) {
-            return Err(Fail::bad_request(format!(
-                "bad name {n:?}: use [A-Za-z0-9._+:-]{{1,128}}"
-            ))
-            .into_api());
+    for (what, v) in [("name", &p.name), ("base", &p.base)] {
+        if let Some(v) = v {
+            if !valid_tag_value(v) {
+                return Err(Fail::bad_request(format!(
+                    "bad {what} {v:?}: use [A-Za-z0-9._+:-]{{1,128}}"
+                ))
+                .into_api());
+            }
         }
     }
+    // A base is filled with a disk image, which brings its own partition
+    // table, and is never measured.
+    let raw = p.raw.unwrap_or(false) || p.base.is_some();
     let want = p.bytes.or_else(|| parse_lv_size(&size));
-    let name = p.name.clone();
+    let (name, base) = (p.name.clone(), p.base.clone());
     let mut m = run_blocking(move || {
         with_ops(|| {
-            if let Some(name) = &name {
+            let mut tags = Vec::new();
+            if name.is_some() || base.is_some() {
                 let lvs = list_lvs().map_err(Fail::ctx("lvs"))?;
-                if let Some(lv) = find_tagged(&lvs, &format!("{TAG_NAME}={name}")) {
-                    return existing_named(lv, name, want);
+                if let Some(image) = &base {
+                    if let Some(lv) = find_tagged(&lvs, &format!("{TAG_BASE}={image}")) {
+                        return existing_base(lv, image, want);
+                    }
+                    tags.push(format!("{TAG_BASE}={image}"));
+                }
+                if let Some(name) = &name {
+                    if let Some(lv) = find_tagged(&lvs, &format!("{TAG_NAME}={name}")) {
+                        return existing_named(lv, name, want);
+                    }
+                    tags.push(format!("{TAG_NAME}={name}"));
                 }
             }
             let id = new_id();
-            info!("configure: new volume {id} ({size}, raw={raw}, name={name:?})");
-            let tags: Vec<String> = name.iter().map(|n| format!("{TAG_NAME}={n}")).collect();
-            create_and_export(&id, &size, raw, &tags).map(|(m, _port)| m)
+            info!("configure: new volume {id} ({size}, raw={raw}, name={name:?}, base={base:?})");
+            let (mut m, _port) = create_and_export(&id, &size, raw, &tags)?;
+            if base.is_some() {
+                m.base = base.clone();
+                m.sealed = Some(false);
+            }
+            Ok(m)
         })
     })
     .await?;
-    if m.existing {
+    if m.existing || m.base.is_some() {
         return Ok(Json(m));
     }
     let id = m.id.clone();
@@ -821,6 +890,81 @@ fn existing_named(lv: &Lv, name: &str, want: Option<u64>) -> Res<Message> {
     Ok(m)
 }
 
+/// Under OPS: `?base=` matched `lv`. A sealed base comes back unexported;
+/// an unsealed one exported, for filling.
+fn existing_base(lv: &Lv, image: &str, want: Option<u64>) -> Res<Message> {
+    if let Some(w) = want {
+        if lv.bytes < w {
+            return Err(Fail::conflict(format!(
+                "base {} for {image} has {} bytes, fewer than the {w} requested",
+                lv.name, lv.bytes
+            )));
+        }
+    }
+    if has_tag(&lv.tags, TAG_SEALED) {
+        info!("{image}: returning sealed base {}", lv.name);
+        return Ok(Message::sealed_base(lv, image));
+    }
+    info!("{image}: returning unsealed base {}", lv.name);
+    let mut m = export_or_existing(&lv.name, &lv.tags)?;
+    m.existing = true;
+    m.base = Some(image.to_string());
+    m.sealed = Some(false);
+    Ok(m)
+}
+
+/// GET /seal/<id>: a filled base is frozen: unexported, never exported
+/// again, clone-only. Idempotent.
+async fn seal(EP(id): EP<String>) -> std::result::Result<Json<SealReply>, ApiError> {
+    info!("seal {id}");
+    run_blocking(move || {
+        with_ops(|| {
+            let lvs = list_lvs().map_err(Fail::ctx("lvs"))?;
+            let lv = lvs
+                .iter()
+                .find(|l| l.name == id)
+                .ok_or_else(|| Fail::not_found(&id))?;
+            let Some(image) = tag_value(&lv.tags, TAG_BASE) else {
+                return Err(Fail::bad_request(format!("{id} is not a base volume")));
+            };
+            remove_export(&id).map_err(Fail::ctx("nvmet teardown"))?;
+            let del: Vec<String> = lv
+                .tags
+                .iter()
+                .filter(|t| t.starts_with("abe_port="))
+                .cloned()
+                .collect();
+            let add: Vec<String> = (!has_tag(&lv.tags, TAG_SEALED))
+                .then(|| TAG_SEALED.to_string())
+                .into_iter()
+                .collect();
+            retag(&id, &del, &add).map_err(Fail::ctx("lvchange tags"))?;
+            info!("sealed base {id} for {image}");
+            Ok(SealReply {
+                id: id.clone(),
+                base: image.to_string(),
+                sealed: true,
+                bytes: lv.bytes,
+            })
+        })
+    })
+    .await
+    .map(Json)
+}
+
+/// GET /version: what this abe is and can do.
+async fn version() -> Json<Version> {
+    let mut features = vec!["reexport", "ports", "name", "trim"];
+    if thin_pool().is_some() {
+        // bases are only useful as thin clone origins
+        features.extend(["base", "clone"]);
+    }
+    Json(Version {
+        version: env!("CARGO_PKG_VERSION"),
+        features,
+    })
+}
+
 /// Under OPS: make the LV, export it on a free port and tag it with
 /// `abe_port=<port>` plus `tags`. If anything after lvcreate fails the LV
 /// is removed again, so a failed create leaves nothing behind.
@@ -870,6 +1014,9 @@ fn rollback_lv(id: &str) {
 /// Under OPS: export `id` if it is not already, record the port, and
 /// return the connect reply either way (GET /id and re-export).
 fn export_or_existing(id: &str, tags: &[String]) -> Res<Message> {
+    if has_tag(tags, TAG_SEALED) {
+        return Err(Fail::conflict(format!("{id} is a sealed base; clone it")));
+    }
     if let Some(svc) = existing_export(id) {
         info!("{id} already exported on port {svc}");
         if let Ok(p) = svc.parse::<u16>() {
@@ -1071,6 +1218,20 @@ fn remove_volume(id: &str) -> Res<Message> {
     if !exported && !Path::new(&lv).exists() {
         return Err(Fail::not_found(id));
     }
+    if let Ok(lvs) = list_lvs() {
+        if let Some(image) = lvs
+            .iter()
+            .find(|l| l.name == id)
+            .and_then(|l| tag_value(&l.tags, TAG_BASE))
+        {
+            // thin snapshots do not depend on their origin LV
+            let clones = lvs
+                .iter()
+                .filter(|l| l.origin.as_deref() == Some(id))
+                .count();
+            warn!("deleting base {image} ({id}); {clones} clones keep their data");
+        }
+    }
     let port = remove_export(id).map_err(Fail::ctx("nvmet teardown"))?;
     if Path::new(&lv).exists() {
         remove_holders(&lv).map_err(Fail::ctx("remove partition mappings"))?;
@@ -1092,6 +1253,8 @@ fn remove_volume(id: &str) -> Res<Message> {
         bytes: None,
         perf: None,
         existing: false,
+        base: None,
+        sealed: None,
     })
 }
 
@@ -1165,6 +1328,9 @@ fn clone_locked(origin: &str, p: &CloneParams) -> Res<CloneReply> {
             )));
         }
     }
+    if has_tag(&src.tags, TAG_BASE) && !has_tag(&src.tags, TAG_SEALED) {
+        return Err(Fail::conflict(format!("base {origin} is not sealed yet")));
+    }
     let grow_to = p.bytes.filter(|b| *b > src.bytes);
 
     let id = new_id();
@@ -1175,7 +1341,10 @@ fn clone_locked(origin: &str, p: &CloneParams) -> Res<CloneReply> {
     }
     clone_lv(origin, &id, grow_to).map_err(Fail::ctx("clone_lv"))?;
     let tags: Vec<String> = p.name.iter().map(|n| format!("{TAG_NAME}={n}")).collect();
-    let (export, _port) = export_new(&id, &tags).inspect_err(|_| rollback_lv(&id))?;
+    let (export, _port) = strip_inherited_tags(&id)
+        .map_err(Fail::ctx("lvchange tags"))
+        .and_then(|_| export_new(&id, &tags))
+        .inspect_err(|_| rollback_lv(&id))?;
     let bytes = export.bytes.unwrap_or(grow_to.unwrap_or(src.bytes));
     Ok(CloneReply {
         export,
@@ -1184,6 +1353,25 @@ fn clone_locked(origin: &str, p: &CloneParams) -> Res<CloneReply> {
         layers,
         warning,
     })
+}
+
+/// A snapshot may have inherited its origin's abe_* tags (base, sealed,
+/// name, port); none of them are true of the clone.
+fn strip_inherited_tags(id: &str) -> Result<()> {
+    let lvs = list_lvs()?;
+    let Some(lv) = lvs.iter().find(|l| l.name == id) else {
+        return Ok(());
+    };
+    let del: Vec<String> = lv
+        .tags
+        .iter()
+        .filter(|t| t.starts_with("abe_"))
+        .cloned()
+        .collect();
+    if !del.is_empty() {
+        info!("{id}: dropping inherited tags {del:?}");
+    }
+    retag(id, &del, &[])
 }
 
 /// Thin snapshot of `origin` named `name`, activated, optionally grown to
@@ -1448,6 +1636,9 @@ fn list_volumes() -> Result<Vec<Volume>> {
             origin: l.origin.clone(),
             layers: n,
             warning: layer_warning(&l.name, n),
+            base: tag_value(&l.tags, TAG_BASE).map(str::to_string),
+            sealed: has_tag(&l.tags, TAG_SEALED),
+            name: tag_value(&l.tags, TAG_NAME).map(str::to_string),
         });
     }
     Ok(vols)
@@ -1864,7 +2055,9 @@ async fn main() {
         .route("/clone/:id", get(clone_volume))
         .route("/volumes", get(volumes))
         .route("/utilization", get(utilization))
-        .route("/reexport", get(reexport));
+        .route("/reexport", get(reexport))
+        .route("/seal/:id", get(seal))
+        .route("/version", get(version));
 
     info!(
         "vg={} thin_pool={:?} bind={} advertise={} nvmet={} ports={port_min}-{port_max}",
