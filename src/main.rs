@@ -4,6 +4,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use if_addrs::get_if_addrs;
 use log::{error, info, warn};
 use nix::mount::{mount, MsFlags};
@@ -13,11 +14,12 @@ use std::collections::BTreeSet;
 use std::env::var;
 use std::fmt::Display;
 use std::fs::{self, write, File};
-use std::io::{Error, ErrorKind, Result, Write};
+use std::io::{BufReader, Error, ErrorKind, Result, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 //use env_inventory;
 
@@ -74,9 +76,107 @@ fn advertised_traddr() -> String {
         .unwrap_or_else(bind_traddr)
 }
 
-/// HTTP listen address (ABE_LISTEN, default 0.0.0.0:80).
+/// API listen address (ABE_LISTEN, default 0.0.0.0:443).
 fn listen_addr() -> String {
-    var("ABE_LISTEN").unwrap_or_else(|_| "0.0.0.0:80".to_string())
+    var("ABE_LISTEN").unwrap_or_else(|_| "0.0.0.0:443".to_string())
+}
+
+/// Is the API served over mutual TLS? ABE_TLS, default on; `off` means
+/// plain HTTP (the unprivileged test harness, standalone experiments).
+fn tls_enabled() -> bool {
+    var("ABE_TLS").map(|v| v.trim() != "off").unwrap_or(true)
+}
+
+/// A PEM path from the environment, with its default under /etc/abe.
+fn tls_path(key: &str, default: &str) -> PathBuf {
+    PathBuf::from(
+        var(key)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default.to_string()),
+    )
+}
+
+/// (server cert, private key, client CA bundle): ABE_TLS_CERT,
+/// ABE_TLS_KEY and ABE_TLS_CA, default /etc/abe/{cert,key,ca}.pem.
+fn tls_paths() -> (PathBuf, PathBuf, PathBuf) {
+    (
+        tls_path("ABE_TLS_CERT", "/etc/abe/cert.pem"),
+        tls_path("ABE_TLS_KEY", "/etc/abe/key.pem"),
+        tls_path("ABE_TLS_CA", "/etc/abe/ca.pem"),
+    )
+}
+
+/// rustls wants one process-wide crypto provider; pick it once. Harmless
+/// if it was already installed (tests build several configs).
+fn ensure_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+/// Every certificate in the PEM file at `path`; an error names the path.
+fn read_pem_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let at = |e: Error| Error::new(e.kind(), format!("{}: {e}", path.display()));
+    let mut r = BufReader::new(File::open(path).map_err(at)?);
+    let certs: Vec<_> = rustls_pemfile::certs(&mut r)
+        .collect::<Result<_>>()
+        .map_err(at)?;
+    if certs.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("{}: no certificate in it", path.display()),
+        ));
+    }
+    Ok(certs)
+}
+
+/// The first private key (PKCS#8, RSA or EC PEM) in the file at `path`.
+fn read_pem_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let at = |e: Error| Error::new(e.kind(), format!("{}: {e}", path.display()));
+    let mut r = BufReader::new(File::open(path).map_err(at)?);
+    rustls_pemfile::private_key(&mut r)
+        .map_err(at)?
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("{}: no private key in it", path.display()),
+            )
+        })
+}
+
+/// A verifier that accepts only client certificates chaining to the CAs
+/// in `ca` (no unauthenticated clients).
+fn client_verifier(ca: &Path) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
+    ensure_crypto_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    for c in read_pem_certs(ca)? {
+        roots.add(c).map_err(|e| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("{}: not a CA certificate: {e}", ca.display()),
+            )
+        })?;
+    }
+    rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| Error::other(format!("{}: client verifier: {e}", ca.display())))
+}
+
+/// Mutual-TLS server config: our `cert`+`key`, clients must chain to `ca`.
+fn tls_config_from(cert: &Path, key: &Path, ca: &Path) -> Result<Arc<rustls::ServerConfig>> {
+    let verifier = client_verifier(ca)?;
+    let chain = read_pem_certs(cert)?;
+    let key_der = read_pem_key(key)?;
+    let cfg = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(chain, key_der)
+        .map_err(|e| Error::other(format!("{} / {}: {e}", cert.display(), key.display())))?;
+    Ok(Arc::new(cfg))
+}
+
+/// The server config from ABE_TLS_CERT / ABE_TLS_KEY / ABE_TLS_CA.
+fn tls_config() -> Result<Arc<rustls::ServerConfig>> {
+    let (cert, key, ca) = tls_paths();
+    tls_config_from(&cert, &key, &ca)
 }
 
 /// Volume ids are v4 UUIDs without dashes; nvmet wants the dashed form for
@@ -242,8 +342,11 @@ struct SealReply {
 struct Version {
     version: &'static str,
     /// what this abe can do, for callers that must also work with older
-    /// ones: reexport, ports, name, trim, and (with a thin pool) base, clone
+    /// ones: reexport, ports, name, trim, tls, fence, and (with a thin
+    /// pool) base, clone
     features: Vec<&'static str>,
+    /// the API is served over mutual TLS (ABE_TLS)
+    tls: bool,
 }
 
 impl Message {
@@ -954,15 +1057,20 @@ async fn seal(EP(id): EP<String>) -> std::result::Result<Json<SealReply>, ApiErr
 
 /// GET /version: what this abe is and can do.
 async fn version() -> Json<Version> {
-    let mut features = vec!["reexport", "ports", "name", "trim"];
+    Json(version_info())
+}
+
+fn version_info() -> Version {
+    let mut features = vec!["reexport", "ports", "name", "trim", "tls", "fence"];
     if thin_pool().is_some() {
         // bases are only useful as thin clone origins
         features.extend(["base", "clone"]);
     }
-    Json(Version {
+    Version {
         version: env!("CARGO_PKG_VERSION"),
         features,
-    })
+        tls: tls_enabled(),
+    }
 }
 
 /// Under OPS: make the LV, export it on a free port and tag it with
@@ -2073,15 +2181,62 @@ async fn main() {
         advertised_traddr(),
         nvmet_path()
     );
-    let listener = tokio::net::TcpListener::bind(listen_addr()).await.unwrap();
-    if let Ok(addrs) = get_if_addrs() {
-        for iface in addrs {
-            if iface.ip().is_ipv4() && !iface.is_loopback() {
-                println!("Listening on http://{}", iface.ip());
+    serve(app).await;
+}
+
+/// Bind ABE_LISTEN and serve `app` over mutual TLS (or plain HTTP with
+/// ABE_TLS=off) until the process ends. Handlers get the peer address in
+/// both modes.
+async fn serve(app: Router) {
+    let addr: SocketAddr = match listen_addr().parse() {
+        Ok(a) => a,
+        Err(e) => {
+            error!("ABE_LISTEN={:?}: {e}", listen_addr());
+            std::process::exit(2);
+        }
+    };
+    let tls = if tls_enabled() {
+        match tls_config() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                error!("cannot load the TLS configuration: {e}");
+                std::process::exit(3);
             }
         }
+    } else {
+        warn!("ABE_TLS=off: the API is served over plain HTTP without authentication");
+        None
+    };
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let shown = if addr.ip().is_unspecified() {
+        get_if_addrs()
+            .map(|addrs| {
+                addrs
+                    .into_iter()
+                    .filter(|i| i.ip().is_ipv4() && !i.is_loopback())
+                    .map(|i| i.ip().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        vec![addr.ip().to_string()]
+    };
+    for ip in shown {
+        println!("Listening on {scheme}://{ip}:{}", addr.port());
     }
-    axum::serve(listener, app).await.unwrap();
+    let svc = app.into_make_service_with_connect_info::<SocketAddr>();
+    let r = match tls {
+        Some(cfg) => {
+            axum_server::bind_rustls(addr, RustlsConfig::from_config(cfg))
+                .serve(svc)
+                .await
+        }
+        None => axum_server::bind(addr).serve(svc).await,
+    };
+    if let Err(e) = r {
+        error!("serving {scheme}://{addr}: {e}");
+        std::process::exit(5);
+    }
 }
 
 #[cfg(test)]
@@ -2587,5 +2742,132 @@ mod tests {
         assert!(!is_volume_id("base-xdebbie-base"));
         assert!(!is_volume_id("0123456789abcdef0123456789abcde"));
         assert!(!is_volume_id("0123456789abcdef0123456789abcdeg"));
+    }
+
+    // ---- TLS --------------------------------------------------------------
+
+    /// tests/certs/<name>: the committed test-only PKI (see README.txt there).
+    fn cert(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/certs")
+            .join(name)
+    }
+
+    #[test]
+    fn tls_config_loads_the_test_pki() {
+        let cfg = tls_config_from(
+            &cert("server.pem"),
+            &cert("server-key.pem"),
+            &cert("ca.pem"),
+        );
+        assert!(cfg.is_ok(), "{:?}", cfg.err());
+        // every failure names the file that is wrong
+        for (c, k, ca) in [
+            ("missing.pem", "server-key.pem", "ca.pem"),
+            ("server.pem", "missing-key.pem", "ca.pem"),
+            ("server.pem", "server-key.pem", "missing-ca.pem"),
+            ("server.pem", "ca.pem", "ca.pem"), // no key in there
+            ("server.pem", "other-ca-key.pem", "ca.pem"), // key does not match the cert
+            ("README.txt", "server-key.pem", "ca.pem"), // no cert in there
+        ] {
+            let e = tls_config_from(&cert(c), &cert(k), &cert(ca)).unwrap_err();
+            let msg = e.to_string();
+            assert!(
+                msg.contains("tests/certs/"),
+                "{c} {k} {ca}: error does not name a path: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_verifier_wants_our_ca() {
+        use rustls::server::danger::ClientCertVerifier;
+        let client = read_pem_certs(&cert("client.pem")).unwrap().remove(0);
+        let now = rustls::pki_types::UnixTime::now();
+        let ours = client_verifier(&cert("ca.pem")).unwrap();
+        assert!(ours.verify_client_cert(&client, &[], now).is_ok());
+        assert!(ours.client_auth_mandatory(), "clients must present a cert");
+        let theirs = client_verifier(&cert("other-ca.pem")).unwrap();
+        assert!(theirs.verify_client_cert(&client, &[], now).is_err());
+        let other = read_pem_certs(&cert("other-client.pem")).unwrap().remove(0);
+        assert!(ours.verify_client_cert(&other, &[], now).is_err());
+        assert!(theirs.verify_client_cert(&other, &[], now).is_ok());
+    }
+
+    #[test]
+    fn version_reports_tls_and_fence() {
+        let v: serde_json::Value = serde_json::to_value(version_info()).unwrap();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert!(v["tls"].is_boolean());
+        let f = v["features"].as_array().unwrap();
+        for want in ["reexport", "ports", "name", "trim", "tls", "fence"] {
+            assert!(f.iter().any(|x| x == want), "feature {want} missing: {f:?}");
+        }
+    }
+
+    /// A rustls client that trusts tests/certs/ca.pem, with or without the
+    /// test client certificate.
+    fn tls_client(with_cert: bool) -> tokio_rustls::TlsConnector {
+        ensure_crypto_provider();
+        let mut roots = rustls::RootCertStore::empty();
+        for c in read_pem_certs(&cert("ca.pem")).unwrap() {
+            roots.add(c).unwrap();
+        }
+        let b = rustls::ClientConfig::builder().with_root_certificates(roots);
+        let cfg = if with_cert {
+            b.with_client_auth_cert(
+                read_pem_certs(&cert("client.pem")).unwrap(),
+                read_pem_key(&cert("client-key.pem")).unwrap(),
+            )
+            .unwrap()
+        } else {
+            b.with_no_client_auth()
+        };
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
+    }
+
+    /// GET /version over TLS from the client `c`; the raw HTTP/1.1 reply.
+    async fn tls_get_version(c: &tokio_rustls::TlsConnector, addr: SocketAddr) -> Result<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut s = c.connect(name, tcp).await?;
+        s.write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut out = String::new();
+        s.read_to_string(&mut out).await?;
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn serves_version_only_to_clients_with_our_cert() {
+        let cfg = tls_config_from(
+            &cert("server.pem"),
+            &cert("server-key.pem"),
+            &cert("ca.pem"),
+        )
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/version", get(version));
+        let server = tokio::spawn(
+            axum_server::from_tcp_rustls(listener, RustlsConfig::from_config(cfg))
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>()),
+        );
+        let reply = tls_get_version(&tls_client(true), addr).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+        let body = reply.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert!(v["features"].as_array().unwrap().iter().any(|f| f == "tls"));
+        // without a client certificate the handshake is refused: no reply
+        match tls_get_version(&tls_client(false), addr).await {
+            Err(e) => assert!(
+                e.to_string().to_lowercase().contains("certificate"),
+                "unexpected error: {e}"
+            ),
+            Ok(r) => panic!("served without a client certificate: {r}"),
+        }
+        server.abort();
     }
 }
