@@ -22,19 +22,23 @@ pass() { echo "  ok  $*"; }
 skip() { echo "  skip $*"; }
 fail() { echo "FAIL $*" >&2; exit 1; }
 
-created=()
+tmp=$(mktemp -d)
+# Ids of every volume this run created, one per line. A file rather than an
+# array because mk() runs inside $(...) and an array append there is lost.
+created=$tmp/created; : > "$created"
 dropin=/run/systemd/system/abe.service.d/e2e.conf
 cleanup() {
     set +e
-    for id in "${created[@]:-}"; do
+    while read -r id; do
         [ -n "$id" ] || continue
         nvme disconnect -n "$id" >/dev/null 2>&1
         curl -s -o /dev/null -X DELETE "$URL/id/$id"
-    done
+    done < "$created"
     if [ -e "$dropin" ]; then
         rm -f "$dropin"; rmdir "$(dirname "$dropin")" 2>/dev/null
         systemctl daemon-reload; systemctl restart abe
     fi
+    rm -rf "$tmp"
 }
 trap cleanup EXIT
 
@@ -44,7 +48,7 @@ trap cleanup EXIT
 mk() {
     local r
     r=$(curl -sf "$URL/configure?$1") || fail "configure?$1"
-    created+=("$(echo "$r" | jq -r .id)")
+    echo "$r" | jq -r .id >> "$created"
     echo "$r"
 }
 # status <method> <path> -> HTTP code
@@ -112,7 +116,7 @@ pass "/utilization (reexport summary: $(curl -sf "$URL/utilization" | jq -c .ree
 
 if [ -n "$THIN" ]; then
     c=$(curl -sf "$URL/clone/$id?bytes=$((128<<20))") || fail "clone"
-    cid=$(echo "$c" | jq -r .id); cport=$(echo "$c" | jq -r .port); created+=("$cid")
+    cid=$(echo "$c" | jq -r .id); cport=$(echo "$c" | jq -r .port); echo "$cid" >> "$created"
     echo "$c" | jq -e --arg id "$id" '.origin == $id and .layers == 1 and .bytes == 134217728 and (.warning == null) and .existing == false' >/dev/null || fail "clone reply: $c"
     volume "$cid" | jq -e --arg o "$id" 'select(.origin==$o and .layers==1 and .bytes==134217728)' >/dev/null || fail "/volumes lists the clone"
     cdev=$(connect "$cid" "$cport")
@@ -141,7 +145,6 @@ pass "port reuse: D took B's port $bport"
 
 # ---- 3. concurrency: 8 parallel creates -----------------------------------
 
-tmp=$(mktemp -d); trap 'rm -rf "$tmp"; cleanup' EXIT
 for i in $(seq 1 8); do
     curl -sf "$URL/configure?bytes=$((32<<20))&raw=true" > "$tmp/c$i" &
 done
@@ -151,7 +154,7 @@ for i in $(seq 1 8); do
     [ -s "$tmp/c$i" ] || fail "parallel create $i failed"
     ids+=("$(jq -r .id "$tmp/c$i")"); ports+=("$(jq -r .port "$tmp/c$i")")
 done
-created+=("${ids[@]}")
+printf "%s\n" "${ids[@]}" >> "$created"
 [ "$(printf '%s\n' "${ports[@]}" | sort -u | wc -l)" = 8 ] || fail "8 creates gave ports: ${ports[*]}"
 [ "$(printf '%s\n' "${ids[@]}" | sort -u | wc -l)" = 8 ] || fail "8 creates gave ids: ${ids[*]}"
 for i in "${!ids[@]}"; do
@@ -168,7 +171,7 @@ curl -sf "$URL/configure?bytes=$((32<<20))&raw=true&name=e2e-x" > "$tmp/n1" &
 curl -sf "$URL/configure?bytes=$((32<<20))&raw=true&name=e2e-x" > "$tmp/n2" &
 wait
 [ -s "$tmp/n1" ] && [ -s "$tmp/n2" ] || fail "named creates failed"
-n1=$(jq -r .id "$tmp/n1"); n2=$(jq -r .id "$tmp/n2"); created+=("$n1")
+n1=$(jq -r .id "$tmp/n1"); n2=$(jq -r .id "$tmp/n2"); echo "$n1" >> "$created"
 [ "$n1" = "$n2" ] || fail "name=e2e-x gave two ids $n1 $n2"
 [[ "$(jq -r .existing "$tmp/n1")$(jq -r .existing "$tmp/n2")" == *true* ]] || fail "neither named reply says existing"
 [ "$(lvs --noheadings -o lv_tags "$VG" | grep -c 'abe_name=e2e-x')" = 1 ] || fail "not exactly one LV tagged abe_name=e2e-x"
@@ -233,7 +236,7 @@ if [ -n "$THIN" ]; then
     cl=()
     for n in 1 2; do
         c=$(curl -sf "$URL/clone/$bid?bytes=$((64<<20))&name=e2e-clone-$n") || fail "clone $n of the base"
-        cid=$(echo "$c" | jq -r .id); created+=("$cid"); cl+=("$cid")
+        cid=$(echo "$c" | jq -r .id); echo "$cid" >> "$created"; cl+=("$cid")
         volume "$cid" | jq -e --arg o "$bid" 'select(.origin==$o and .base==null and .sealed==false and .name=="e2e-clone-'"$n"'")' >/dev/null || fail "/volumes for clone $n"
         cdev=$(connect "$cid" "$(echo "$c" | jq -r .port)")
         readback "$cdev" "base image" || { disconnect "$cid"; fail "clone $n does not read the base marker"; }
