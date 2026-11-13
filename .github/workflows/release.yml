@@ -1,0 +1,32 @@
+# Tag v<version> (make tag && make push) and this builds the .deb and
+# publishes a GitHub Release with the CHANGELOG section for that version.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-deb --locked
+      - run: cargo deb
+      - name: version and notes
+        id: meta
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          # the CHANGELOG section for this version: from its "## " heading
+          # to the next one
+          awk -v v="$v" '/^## /{p = index($0, v) > 0} p' CHANGELOG.md \
+            | sed '1d' > notes.md
+          test -s notes.md || echo "See CHANGELOG.md." > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: abe ${{ steps.meta.outputs.version }}
+          body_path: notes.md
+          files: target/debian/*.deb
