@@ -1028,7 +1028,10 @@ fn export_or_existing(id: &str, tags: &[String]) -> Res<Message> {
     }
     let port = pick_port()?;
     let m = export(id, port).map_err(Fail::ctx("export"))?;
-    set_port_tag(id, tags, port).map_err(Fail::ctx("lvchange tags"))?;
+    // The export is up; the tag only matters for the next restart.
+    if let Err(e) = set_port_tag(id, tags, port) {
+        warn!("could not record port {port} on {id}: {e}");
+    }
     Ok(m)
 }
 
