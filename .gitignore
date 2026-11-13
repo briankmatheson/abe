@@ -1,0 +1,9 @@
+*~
+*#
+/target
+*.ks
+*.qcow2*
+admin
+firstboot.sh
+root
+password
