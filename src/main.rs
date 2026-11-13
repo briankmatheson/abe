@@ -242,6 +242,10 @@ struct Perf {
     write_iops: f64,
     /// mean completion latency
     write_lat_us: f64,
+    /// the region fio wrote was discarded (thin: given back to the pool)
+    /// or zeroed (thick) afterwards; false if that failed
+    #[serde(default)]
+    trimmed: bool,
 }
 
 /// How long fio writes to each new volume (ABE_FIO_SECONDS, default 5;
@@ -694,21 +698,78 @@ async fn configure(
         run_blocking(move || with_ops(|| create_and_export(&id, &size, raw, &[]))).await?
     };
     // Measure after the export is set up so a fio problem cannot cost the
-    // caller its volume; the data written is garbage on a blank volume.
+    // caller its volume. fio stays inside partition 1 on a non-raw volume
+    // and the region is trimmed afterwards, so the caller gets a blank
+    // volume that occupies nothing in the pool.
     let dev = lv_path_for_uuid(&id);
-    let bytes = m.bytes.unwrap_or(1 << 30);
-    m.perf = match tokio::task::spawn_blocking(move || characterize(&dev, bytes)).await {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            warn!("fio on {id}: {e}");
+    let thin = thin_pool().is_some();
+    m.perf = match fio_region(m.bytes.unwrap_or(0), raw) {
+        None => {
+            info!("{id}: too small for the fio check; skipped");
             None
         }
-        Err(e) => {
-            warn!("fio task on {id}: {e}");
-            None
+        Some(region) => {
+            let dev = dev.clone();
+            match tokio::task::spawn_blocking(move || characterize(&dev, region, thin)).await {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    warn!("fio on {id}: {e}");
+                    None
+                }
+                Err(e) => {
+                    warn!("fio task on {id}: {e}");
+                    None
+                }
+            }
         }
     };
+    if !raw && m.perf.is_some() {
+        // Should never fire; turns a silent corruption into a loud one.
+        let (d, i) = (dev.clone(), id.clone());
+        match tokio::task::spawn_blocking(move || gpt_intact(&d, &i)).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                error!("fio damaged the partition table of {id}; removing it");
+                let i = id.clone();
+                if let Err(e) = run_blocking(move || with_ops(|| remove_volume(&i))).await {
+                    warn!("could not remove {id}: {}", e.1.error);
+                }
+                return Err(Fail::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("fio damaged the partition table of {id}"),
+                )
+                .into_api());
+            }
+            Ok(Err(e)) => warn!("could not verify the partition table of {id}: {e}"),
+            Err(e) => warn!("parted task on {id}: {e}"),
+        }
+    }
     Ok(Json(m))
+}
+
+const MIB: u64 = 1 << 20;
+const GIB: u64 = 1 << 30;
+
+/// Where fio writes on a new volume.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Region {
+    offset: u64,
+    len: u64,
+}
+
+/// The fio region for a volume of `bytes`: the first GiB of a raw volume;
+/// inside partition 1 (which `parted mkpart primary 1MiB 100%` starts at
+/// 1 MiB) and 1 MiB clear of the backup GPT in the last 33 sectors
+/// otherwise. Whole MiBs, so a trim frees every thin chunk it covers.
+/// None when there is not 16 MiB to write on.
+fn fio_region(bytes: u64, raw: bool) -> Option<Region> {
+    let (start, end) = if raw {
+        (0, bytes)
+    } else {
+        (MIB, bytes.saturating_sub(MIB))
+    };
+    let len = (end.saturating_sub(start)).min(GIB) & !(MIB - 1);
+    (len >= 16 * MIB).then_some(Region { offset: start, len })
 }
 
 /// Under OPS: make the LV, export it on a free port and tag it with
@@ -776,18 +837,22 @@ fn export_or_existing(id: &str, tags: &[String]) -> Res<Message> {
 }
 
 /// Direct-I/O fio straight at the LV: random writes at ABE_FIO_BS,
-/// ABE_FIO_IODEPTH in flight, over the first GiB, ABE_FIO_RAMP seconds of
+/// ABE_FIO_IODEPTH in flight, over `region` (never the dm partition
+/// device, which would hold the LV open), ABE_FIO_RAMP seconds of
 /// warm-up that fio does not count (device queues, caches and the first
-/// thin-chunk allocations settle), then ABE_FIO_SECONDS measured.
-/// Ok(None) when disabled.
-fn characterize(dev: &str, bytes: u64) -> Result<Option<Perf>> {
+/// thin-chunk allocations settle), then ABE_FIO_SECONDS measured. The
+/// region is trimmed afterwards. Ok(None) when disabled. Runs outside
+/// OPS.
+fn characterize(dev: &str, region: Region, thin: bool) -> Result<Option<Perf>> {
     let secs = fio_seconds();
     if secs == 0 {
         return Ok(None);
     }
     let (bs, iodepth, ramp) = (fio_bs(), fio_iodepth(), fio_ramp());
-    let region = bytes.min(1 << 30);
-    info!("fio: {ramp}s warm-up then {secs}s of {bs} random writes, iodepth {iodepth}, on the first {region} bytes of {dev}");
+    info!(
+        "fio: {ramp}s warm-up then {secs}s of {bs} random writes, iodepth {iodepth}, on {} bytes at offset {} of {dev}",
+        region.len, region.offset
+    );
     let out = Command::new("fio")
         .args([
             "--name=abe",
@@ -798,8 +863,10 @@ fn characterize(dev: &str, bytes: u64) -> Result<Option<Perf>> {
             &bs,
             "--iodepth",
             &iodepth.to_string(),
+            "--offset",
+            &region.offset.to_string(),
             "--size",
-            &region.to_string(),
+            &region.len.to_string(),
             "--direct=1",
             "--ioengine=libaio",
             "--time_based",
@@ -811,13 +878,91 @@ fn characterize(dev: &str, bytes: u64) -> Result<Option<Perf>> {
         ])
         .output()?;
     check(out.clone(), "fio")?;
-    let perf = parse_fio(&String::from_utf8_lossy(&out.stdout), &bs, iodepth)
+    let mut perf = parse_fio(&String::from_utf8_lossy(&out.stdout), &bs, iodepth)
         .ok_or_else(|| Error::other("fio printed no write results"))?;
     info!(
         "fio on {dev}: {:.0} us mean latency, {:.0} IOPS, {:.1} MiB/s at bs={bs} iodepth={iodepth}",
         perf.write_lat_us, perf.write_iops, perf.write_mib_s
     );
+    perf.trimmed = match trim(dev, region, thin) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("trim of the fio region on {dev} failed: {e}");
+            false
+        }
+    };
     Ok(Some(perf))
+}
+
+/// Give the fio region back: `blkdiscard` on a thin volume returns every
+/// fully covered chunk to the pool (and reads come back as zeros);
+/// `blkdiscard --zeroout` on a thick one frees nothing but leaves the
+/// region blank.
+fn trim(dev: &str, region: Region, thin: bool) -> Result<()> {
+    let mut cmd = Command::new("blkdiscard");
+    if !thin {
+        cmd.arg("--zeroout");
+    }
+    cmd.args([
+        "--offset",
+        &region.offset.to_string(),
+        "--length",
+        &region.len.to_string(),
+        dev,
+    ]);
+    check(cmd.output()?, "blkdiscard")?;
+    info!(
+        "{}: {} bytes at offset {} of {dev}",
+        if thin { "discarded" } else { "zeroed" },
+        region.len,
+        region.offset
+    );
+    Ok(())
+}
+
+/// Does `dev` still carry partition 1, starting at 1 MiB and named `id`?
+fn gpt_intact(dev: &str, id: &str) -> Result<bool> {
+    let out = Command::new("/usr/sbin/parted")
+        .args(["-s", "-m", dev, "unit", "B", "print"])
+        .output()?;
+    check(out.clone(), "parted print")?;
+    Ok(parse_parted_part1(&String::from_utf8_lossy(&out.stdout))
+        .is_some_and(|(start, name)| start == MIB && name == id))
+}
+
+/// (start in bytes, name) of partition 1 in `parted -s -m <dev> unit B print`.
+fn parse_parted_part1(text: &str) -> Option<(u64, String)> {
+    text.lines().find_map(|l| {
+        let f: Vec<&str> = l.trim().trim_end_matches(';').split(':').collect();
+        if f.first() != Some(&"1") || f.len() < 6 {
+            return None;
+        }
+        let start = f[1].trim_end_matches('B').parse().ok()?;
+        Some((start, f[5].to_string()))
+    })
+}
+
+/// Startup check: a thin pool with `discards=ignore` cannot give the fio
+/// region back, so the trim after each create is wasted.
+fn warn_if_discards_ignored() {
+    let Some(pool) = thin_pool() else { return };
+    let vg = vg_name();
+    let out = Command::new("/usr/sbin/lvs")
+        .env("LC_ALL", "C")
+        .args(["--noheadings", "-o", "discards", &format!("{vg}/{pool}")])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            if String::from_utf8_lossy(&o.stdout).trim() == "ignore" {
+                warn!("thin pool discards=ignore: the fio region cannot be returned to the pool; run lvchange --discards passdown {vg}/{pool}");
+            }
+        }
+        Ok(o) => warn!(
+            "cannot read the discard mode of {vg}/{pool}: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => warn!("cannot read the discard mode of {vg}/{pool}: {e}"),
+    }
 }
 
 /// Pull the write numbers out of `fio --output-format=json`.
@@ -840,6 +985,7 @@ fn parse_fio(json: &str, bs: &str, iodepth: u32) -> Option<Perf> {
         write_mib_s: round(bw_bytes / (1024.0 * 1024.0)),
         write_iops: round(iops),
         write_lat_us: round(lat_ns / 1e3),
+        trimmed: false,
     })
 }
 
@@ -1634,6 +1780,8 @@ async fn main() {
         std::process::exit(1);
     }
 
+    warn_if_discards_ignored();
+
     // Everything exported before the restart comes back before the first
     // request can be served, so nobody sees a half-restored target.
     reexport_at_startup().await;
@@ -2026,6 +2174,130 @@ mod tests {
         assert_eq!(p.write_mib_s, 19.53);
         assert_eq!(p.write_iops, 5000.0);
         assert_eq!(p.write_lat_us, 187.46);
+    }
+
+    #[test]
+    fn fio_region_stays_inside_partition_one() {
+        // raw: from the start, capped at a GiB, whole MiBs
+        assert_eq!(
+            fio_region(64 * MIB, true),
+            Some(Region {
+                offset: 0,
+                len: 64 * MIB
+            })
+        );
+        assert_eq!(
+            fio_region(GIB, true),
+            Some(Region {
+                offset: 0,
+                len: GIB
+            })
+        );
+        assert_eq!(
+            fio_region(10 * GIB, true),
+            Some(Region {
+                offset: 0,
+                len: GIB
+            })
+        );
+        assert_eq!(
+            fio_region(64 * MIB + 12345, true),
+            Some(Region {
+                offset: 0,
+                len: 64 * MIB
+            })
+        );
+        // non-raw: starts at 1 MiB, stops 1 MiB short of the end
+        assert_eq!(
+            fio_region(64 * MIB, false),
+            Some(Region {
+                offset: MIB,
+                len: 62 * MIB
+            })
+        );
+        assert_eq!(
+            fio_region(10 * GIB, false),
+            Some(Region {
+                offset: MIB,
+                len: GIB
+            })
+        );
+        assert_eq!(
+            fio_region(GIB + 2 * MIB, false),
+            Some(Region {
+                offset: MIB,
+                len: GIB
+            })
+        );
+        assert_eq!(
+            fio_region(GIB + MIB + 1, false),
+            Some(Region {
+                offset: MIB,
+                len: GIB - MIB
+            })
+        );
+        // too small to bother
+        assert_eq!(fio_region(0, true), None);
+        assert_eq!(fio_region(4 * MIB, true), None);
+        assert_eq!(fio_region(16 * MIB - 1, true), None);
+        assert_eq!(fio_region(16 * MIB, true).map(|r| r.len), Some(16 * MIB));
+        assert_eq!(fio_region(17 * MIB, false), None);
+        assert_eq!(
+            fio_region(18 * MIB, false),
+            Some(Region {
+                offset: MIB,
+                len: 16 * MIB
+            })
+        );
+        // alignment: the length is always a multiple of a MiB
+        for b in [100 * MIB + 1, 777_777_777, 3 * GIB + 5] {
+            for raw in [true, false] {
+                let r = fio_region(b, raw).unwrap();
+                assert_eq!(r.len % MIB, 0, "{b} raw={raw}");
+                assert!(r.offset + r.len <= b);
+            }
+        }
+    }
+
+    #[test]
+    fn parses_parted_partition_one() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let text = format!(
+            "BYT;\n/dev/abe/{id}:67108864B:dm:512:512:gpt:Linux device-mapper (thin):;\n1:1048576B:67091967B:66043392B::{id}:;\n"
+        );
+        assert_eq!(parse_parted_part1(&text), Some((MIB, id.to_string())));
+        assert_eq!(
+            parse_parted_part1("BYT;\n/dev/x:1B:dm:512:512:unknown:x:;\n"),
+            None
+        );
+        assert_eq!(parse_parted_part1(""), None);
+        // a partition that moved is not intact
+        let moved = "1:2097152B:67091967B:64994816B::abc:;\n";
+        assert_eq!(
+            parse_parted_part1(moved),
+            Some((2 * MIB, "abc".to_string()))
+        );
+    }
+
+    #[test]
+    fn perf_reports_trimmed() {
+        let p = Perf {
+            bs: "4k".into(),
+            iodepth: 1,
+            seconds: 5.0,
+            write_mib_s: 1.0,
+            write_iops: 1.0,
+            write_lat_us: 1.0,
+            trimmed: true,
+        };
+        let v: serde_json::Value = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["trimmed"], serde_json::Value::Bool(true));
+        // an old reply without the field still parses
+        let old: Perf = serde_json::from_str(
+            r#"{"bs":"4k","iodepth":1,"seconds":5.0,"write_mib_s":1.0,"write_iops":1.0,"write_lat_us":1.0}"#,
+        )
+        .unwrap();
+        assert!(!old.trimmed);
     }
 
     #[test]
