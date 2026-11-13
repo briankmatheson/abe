@@ -834,15 +834,92 @@ fn reexport_all() -> ReexportSummary {
     reexport_locked()
 }
 
-/// The fence is rebuilt from scratch first: every export that is up
-/// already goes into the new table in the same transaction (to its
-/// recorded client, or the one peer connected to it), so a live
-/// connection never meets an empty table.
+/// What `fence_rebuild` found exported.
+#[derive(Default)]
+struct FenceSync {
+    /// exports that were up, with the client each port is open to
+    already: Vec<(String, u16, Option<Ipv4Addr>)>,
+    /// ids whose port stays closed: no client recorded, none connected
+    closed: Vec<String>,
+}
+
+/// Under OPS: replace the fence with one that allows exactly the live
+/// exports, each to its recorded client or, failing that, to the one
+/// peer connected to it (an export made before the fence existed, which
+/// is then tagged). One transaction, so a connection never meets an
+/// empty table. Err only when nft fails; if lvs fails an empty fence
+/// goes up (closed beats open) and the pass that follows reports it.
+fn fence_rebuild() -> Result<FenceSync> {
+    let mut sync = FenceSync::default();
+    let lvs = match list_lvs() {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("fence: lvs failed ({e}); installing an empty fence");
+            fence_install(&[])?;
+            return Ok(sync);
+        }
+    };
+    let mut keep = Vec::new();
+    for lv in lvs
+        .iter()
+        .filter(|l| is_volume_id(&l.name) && !has_tag(&l.tags, TAG_SEALED))
+    {
+        let id = &lv.name;
+        let Some(port) = existing_export(id).and_then(|p| p.parse::<u16>().ok()) else {
+            continue;
+        };
+        let tagged = tag_value(&lv.tags, TAG_CLIENT).and_then(|v| v.parse::<Ipv4Addr>().ok());
+        let client = tagged.or_else(|| {
+            let peers = established_peers(port);
+            if peers.len() == 1 {
+                let ip = *peers.iter().next().unwrap();
+                info!("adopted {ip} for {id} on {port}");
+                Some(ip)
+            } else {
+                info!(
+                    "{id} on {port}: no client recorded and {} connected; closed until attached again",
+                    peers.len()
+                );
+                None
+            }
+        });
+        match client {
+            Some(ip) => keep.push((ip, port)),
+            None => sync.closed.push(id.clone()),
+        }
+        sync.already.push((id.clone(), port, client));
+    }
+    fence_install(&keep)?;
+    for (id, port, client) in &sync.already {
+        if let Err(e) = lvs
+            .iter()
+            .find(|l| &l.name == id)
+            .map_or(Ok(()), |lv| record_export(id, &lv.tags, *port, *client))
+        {
+            warn!("could not record port {port} on {id}: {e}");
+        }
+    }
+    Ok(sync)
+}
+
+/// The fence is rebuilt first (`fence_rebuild`), then whatever is not
+/// exported is exported and fenced to its recorded client.
 fn reexport_locked() -> ReexportSummary {
     let mut s = ReexportSummary {
         at: now_rfc3339(),
         ..Default::default()
     };
+    match fence_rebuild() {
+        Ok(sync) => {
+            s.already = sync.already.len();
+            s.closed = sync.closed;
+        }
+        Err(e) => {
+            error!("re-export: cannot install the nvmet fence: {e}; nothing re-exported");
+            s.retry = true;
+            return s;
+        }
+    }
     let mut lvs = match list_lvs() {
         Ok(l) => l,
         Err(e) => {
@@ -855,53 +932,6 @@ fn reexport_locked() -> ReexportSummary {
     let (min, max) = port_bounds();
     let root = nvmet_path();
     let mut used = used_ports(Path::new(&root));
-
-    let mut keep = Vec::new();
-    let mut record = Vec::new();
-    for lv in &lvs {
-        if has_tag(&lv.tags, TAG_SEALED) {
-            continue;
-        }
-        let Some(port) = existing_export(&lv.name).and_then(|p| p.parse::<u16>().ok()) else {
-            continue;
-        };
-        let tagged = tag_value(&lv.tags, TAG_CLIENT).and_then(|v| v.parse::<Ipv4Addr>().ok());
-        let client = tagged.or_else(|| {
-            let peers = established_peers(port);
-            if peers.len() == 1 {
-                let ip = *peers.iter().next().unwrap();
-                info!("adopted {ip} for {} on {port}", lv.name);
-                Some(ip)
-            } else {
-                info!(
-                    "{} on {port}: no client recorded and {} connected; closed until attached again",
-                    lv.name,
-                    peers.len()
-                );
-                None
-            }
-        });
-        match client {
-            Some(ip) => keep.push((ip, port)),
-            None => s.closed.push(lv.name.clone()),
-        }
-        record.push((lv, port, client));
-    }
-    if let Err(e) = fence_install(&keep) {
-        error!("re-export: cannot install the nvmet fence: {e}; nothing re-exported");
-        s.retry = true;
-        return s;
-    }
-    for (lv, port, client) in record {
-        if let Err(e) = record_export(&lv.name, &lv.tags, port, client) {
-            warn!(
-                "re-export: could not record port {port} on {}: {e}",
-                lv.name
-            );
-        }
-        s.already += 1;
-    }
-
     for lv in &lvs {
         let id = &lv.name;
         if has_tag(&lv.tags, TAG_SEALED) {
@@ -2615,9 +2645,10 @@ async fn main() {
 
     warn_if_discards_ignored();
 
-    // The fence goes up before any port does, so no export is ever
-    // reachable from everywhere. The re-export pass refills it.
-    if let Err(e) = tokio::task::spawn_blocking(|| fence_install(&[]))
+    // The fence goes up before anything is exported, already holding the
+    // exports that survived the restart (to their recorded or adopted
+    // clients), so no port is ever reachable from everywhere.
+    if let Err(e) = tokio::task::spawn_blocking(|| with_ops(fence_rebuild))
         .await
         .unwrap_or_else(|e| Err(Error::other(e.to_string())))
     {
