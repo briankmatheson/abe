@@ -54,7 +54,12 @@ deb:
 
 $(DEB): deb
 
+# Debian ships an unrelated package also called "abe" (the SDL game). If it is
+# installed, apt sees our version as a downgrade; remove it first.
 install: $(DEB)
+	@if dpkg -s abe 2>/dev/null | grep -q "^Version: 1\."; then \
+	  echo "the Debian 'abe' game is installed; removing it first"; \
+	  sudo apt remove -y abe abe-data; fi
 	sudo apt install -y ./$(DEB)
 
 # make deploy HOSTS="timesink gram"  (ssh as $(SSH_USER); sudo must work there)
