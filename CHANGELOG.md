@@ -5,6 +5,18 @@
 The API moves to HTTPS with mutual TLS, and every nvmet port is fenced
 to the address that asked for it.
 
+### Fence rules judge SYNs only; port range reserved from ephemeral use
+
+- The reject rules match only bare SYNs. For a local initiator both
+  directions of a connection pass the input hook, and with the
+  ephemeral port range (32768-60999) overlapping 44001-44999 the
+  SYN-ACK back to it was reset about one connection in thirty — an
+  `nvme connect` opens seventeen, so roughly every other local connect
+  timed out (`failed to connect socket: -110`). Found by e2e scenario 8.
+- At startup abe appends its port range to
+  `net.ipv4.ip_local_reserved_ports` (best effort, logged), so a local
+  client can no longer take a source port abe later exports on.
+
 ### TLS
 
 - The API is served over TLS with a **required client certificate**:

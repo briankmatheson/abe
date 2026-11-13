@@ -236,10 +236,62 @@ fn nft(args: &[&str], script: Option<&str>) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+const RESERVED_PORTS: &str = "/proc/sys/net/ipv4/ip_local_reserved_ports";
+
+/// Keep the kernel from using `min..=max` as ephemeral source ports
+/// (`net.ipv4.ip_local_reserved_ports`): a local initiator whose source
+/// port landed on an nvmet port would collide with a later export (the
+/// `EADDRNOTAVAIL` that re-export retries around) and, before the fence
+/// learnt to judge SYNs only, had its SYN-ACK reset. Appends to whatever
+/// is already reserved; the kernel merges overlapping ranges. Best effort:
+/// a failure is logged, not fatal.
+fn reserve_ports(path: &Path, min: u16, max: u16) {
+    let want = format!("{min}-{max}");
+    let have = fs::read_to_string(path).unwrap_or_default();
+    match reserved_ports_update(have.trim(), min, max) {
+        None => info!("ports {want} already reserved from ephemeral use"),
+        Some(new) => match fs::write(path, &new) {
+            Ok(()) => info!("reserved ports {want} from ephemeral use ({})", path.display()),
+            Err(e) => warn!(
+                "could not reserve ports {want} from ephemeral use ({}): {e}; local initiators may collide with exports",
+                path.display()
+            ),
+        },
+    }
+}
+
+/// The new `ip_local_reserved_ports` value if `min..=max` is not already
+/// covered by one of `have`'s comma-separated entries (`n` or `a-b`).
+fn reserved_ports_update(have: &str, min: u16, max: u16) -> Option<String> {
+    let covered = have.split(',').map(str::trim).any(|e| {
+        let (a, b) = match e.split_once('-') {
+            Some((a, b)) => (a.parse::<u16>().ok(), b.parse::<u16>().ok()),
+            None => (e.parse::<u16>().ok(), e.parse::<u16>().ok()),
+        };
+        matches!((a, b), (Some(a), Some(b)) if a <= min && b >= max)
+    });
+    if covered {
+        return None;
+    }
+    let want = format!("{min}-{max}");
+    Some(if have.is_empty() {
+        want
+    } else {
+        format!("{have},{want}")
+    })
+}
+
 /// The whole `inet abe` table for the port range `min..=max`, with
 /// `elements` already in the set, as one `nft -f` transaction. `destroy`
 /// (nft >= 1.0.7) so a missing table is not an error. `accept` only ends
 /// this chain: other base chains on input still run.
+///
+/// Only a bare SYN (a new connection attempt) is ever rejected. For a
+/// local initiator both directions of a connection pass the input hook,
+/// and its ephemeral source port can fall inside the nvmet range, so
+/// without the flags test the SYN-ACK back to it (dport = that ephemeral
+/// port, not in the set) would be reset and the connect would time out.
+/// `reserve_ports` keeps the kernel from handing out those ports too.
 fn fence_script(min: u16, max: u16, elements: &[(Ipv4Addr, u16)]) -> String {
     let elems = if elements.is_empty() {
         String::new()
@@ -261,8 +313,10 @@ fn fence_script(min: u16, max: u16, elements: &[(Ipv4Addr, u16)]) -> String {
         "    chain input {".to_string(),
         "        type filter hook input priority filter - 10; policy accept;".to_string(),
         format!("        tcp dport {min}-{max}  ip saddr . tcp dport @allowed  accept"),
-        format!("        tcp dport {min}-{max}  reject with tcp reset"),
-        format!("        meta nfproto ipv6  tcp dport {min}-{max}  reject with tcp reset"),
+        format!("        tcp dport {min}-{max}  tcp flags & (syn | ack) == syn  reject with tcp reset"),
+        format!(
+            "        meta nfproto ipv6  tcp dport {min}-{max}  tcp flags & (syn | ack) == syn  reject with tcp reset"
+        ),
         "    }".to_string(),
         "}".to_string(),
     ]
@@ -2644,6 +2698,7 @@ async fn main() {
     }
 
     warn_if_discards_ignored();
+    reserve_ports(Path::new(RESERVED_PORTS), port_min, port_max);
 
     // The fence goes up before anything is exported, already holding the
     // exports that survived the restart (to their recorded or adopted
@@ -3382,11 +3437,48 @@ table inet abe {
     chain input {
         type filter hook input priority filter - 10; policy accept;
         tcp dport 44001-44999  ip saddr . tcp dport @allowed  accept
-        tcp dport 44001-44999  reject with tcp reset
-        meta nfproto ipv6  tcp dport 44001-44999  reject with tcp reset
+        tcp dport 44001-44999  tcp flags & (syn | ack) == syn  reject with tcp reset
+        meta nfproto ipv6  tcp dport 44001-44999  tcp flags & (syn | ack) == syn  reject with tcp reset
     }
 }
 ";
+
+    #[test]
+    fn reserved_ports_update_appends_unless_covered() {
+        assert_eq!(
+            reserved_ports_update("", 44001, 44999).as_deref(),
+            Some("44001-44999")
+        );
+        assert_eq!(
+            reserved_ports_update("8080,9000-9100", 44001, 44999).as_deref(),
+            Some("8080,9000-9100,44001-44999")
+        );
+        assert_eq!(reserved_ports_update("44001-44999", 44001, 44999), None);
+        assert_eq!(
+            reserved_ports_update("8080,44000-45000", 44001, 44999),
+            None
+        );
+        assert_eq!(
+            reserved_ports_update("44001-44500", 44001, 44999).as_deref(),
+            Some("44001-44500,44001-44999")
+        );
+        // the kernel's own formatting (trailing newline) is tolerated
+        assert_eq!(
+            reserved_ports_update("44001-44999\n".trim(), 44001, 44999),
+            None
+        );
+    }
+
+    #[test]
+    fn reserve_ports_writes_the_file() {
+        let f = std::env::temp_dir().join(format!("abe-reserved-{}", std::process::id()));
+        std::fs::write(&f, "8080\n").unwrap();
+        reserve_ports(&f, 44001, 44999);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "8080,44001-44999");
+        reserve_ports(&f, 44001, 44999);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "8080,44001-44999");
+        let _ = std::fs::remove_file(&f);
+    }
 
     #[test]
     fn fence_script_golden() {

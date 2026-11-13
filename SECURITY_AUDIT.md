@@ -50,6 +50,14 @@ What the fence does **not** do:
   first pass, exactly one established connection to the port is
   adopted; otherwise the port stays closed until the next `GET /id`.
   The adoption trusts whoever was connected at that moment.
+- Only new connection attempts (bare SYNs) are judged. A session that
+  was established while its address was allowed keeps running after the
+  port is moved to another client until it reconnects; `GET /id` from
+  the new client does not cut the old one. The reason is correctness
+  for local initiators: both directions of a local connection pass the
+  input hook, and resetting anything but SYNs resets the SYN-ACK back
+  to an ephemeral port inside the range. abe also reserves the range
+  from ephemeral use (`net.ipv4.ip_local_reserved_ports`).
 - Other base chains on `input` still run (`accept` only ends abe's
   chain); abe never widens another table's policy.
 

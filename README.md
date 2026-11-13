@@ -113,11 +113,20 @@ table inet abe {
     chain input {
         type filter hook input priority filter - 10; policy accept;
         tcp dport 44001-44999  ip saddr . tcp dport @allowed  accept
-        tcp dport 44001-44999  reject with tcp reset
-        meta nfproto ipv6  tcp dport 44001-44999  reject with tcp reset
+        tcp dport 44001-44999  tcp flags & (syn | ack) == syn  reject with tcp reset
+        meta nfproto ipv6  tcp dport 44001-44999  tcp flags & (syn | ack) == syn  reject with tcp reset
     }
 }
 ```
+
+Only a bare SYN (a new connection attempt) is ever rejected, so an
+established session is not cut when its port is moved to another client
+(it loses access on its next reconnect), and a local initiator — whose
+ephemeral source port may fall inside the range, putting the SYN-ACK
+back to it through this same chain — is never reset. For the same reason
+abe reserves the range from ephemeral use at startup
+(`net.ipv4.ip_local_reserved_ports`), which also stops a local client
+from grabbing a port abe later wants to export on.
 
 The range is `ABE_PORT_MIN-ABE_PORT_MAX`. The table goes up before
 anything is exported (startup fails with exit 4 if nft cannot install
