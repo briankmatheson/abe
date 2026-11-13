@@ -1,6 +1,6 @@
 [Unit]
 Description=ABE (Abe Block Exporter) - NVMe-oF Block Storage Server
-Documentation=https://github.com/brianmatheson/abe
+Documentation=https://github.com/briankmatheson/abe
 After=network-online.target lvm2-monitor.service local-fs.target
 Wants=network-online.target
 
