@@ -1096,9 +1096,12 @@ fn characterize(dev: &str, region: Region, thin: bool) -> Result<Option<Perf>> {
 /// Give the fio region back: `blkdiscard` on a thin volume returns every
 /// fully covered chunk to the pool (and reads come back as zeros);
 /// `blkdiscard --zeroout` on a thick one frees nothing but leaves the
-/// region blank.
+/// region blank. `--force` because util-linux >= 2.38 refuses a device
+/// carrying a signature (the GPT on a non-raw volume) without it; the
+/// offset and length keep the trim inside partition 1 regardless.
 fn trim(dev: &str, region: Region, thin: bool) -> Result<()> {
     let mut cmd = Command::new("blkdiscard");
+    cmd.arg("--force");
     if !thin {
         cmd.arg("--zeroout");
     }
