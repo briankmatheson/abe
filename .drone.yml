@@ -1,0 +1,18 @@
+# Drone port of .github/workflows/ci.yml (kube runner on w4).
+kind: pipeline
+type: kubernetes
+name: ci
+
+trigger:
+  event: [push, pull_request]
+
+steps:
+  - name: test
+    image: rust:1
+    commands:
+      - apt-get update -qq && apt-get install -y -qq cmake
+      - rustup component add rustfmt clippy
+      - cargo fmt --check
+      - cargo clippy --all-targets -- -D warnings
+      - cargo test
+      - tests/lint-links.sh
