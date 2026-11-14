@@ -43,5 +43,12 @@
 # and keeps retrying in the background.
 #ABE_REEXPORT_WAIT=90
 
+# Seconds an LVM command (lvs, lvchange, lvcreate, ...) may run before abe
+# looks for NVMe-oF controllers on this host that are stuck "connecting" and
+# deletes them (default: 10; 0 disables). LVM scans every block device, so
+# one controller whose target is gone hangs every LVM command, and abe with
+# it. The check repeats at this interval for as long as the command runs.
+#ABE_LVM_ALARM=10
+
 # nvmet configfs root (default: /sys/kernel/config/nvmet). For tests only.
 #ABE_NVMET_PATH=/sys/kernel/config/nvmet

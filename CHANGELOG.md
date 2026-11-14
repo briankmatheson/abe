@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- LVM watchdog: an LVM command still running after `ABE_LVM_ALARM`
+  seconds (default 10) makes abe delete every NVMe-oF controller on the
+  host that is stuck `connecting`, and again at each further interval.
+  LVM scans every block device, so a controller whose target was gone
+  (`ctrl_loss_tmo=off`) hung `lvchange` forever; abe held its lock
+  behind it, the API stopped accepting and `/version` timed out.
+
 ## 0.5.2
 
 - `/clone` retried with the same `name` returned the existing volume

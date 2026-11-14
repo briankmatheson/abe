@@ -947,6 +947,132 @@ fn reexport_wait() -> u64 {
         .unwrap_or(90)
 }
 
+/// Seconds an LVM command may run before the watchdog looks for dead NVMe
+/// controllers (ABE_LVM_ALARM, default 10; 0 turns the watchdog off). The
+/// alarm repeats at the same interval for as long as the command runs.
+fn lvm_alarm() -> u64 {
+    var("ABE_LVM_ALARM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
+}
+
+/// Where the kernel lists this host's NVMe controllers (ABE_NVME_CLASS_PATH,
+/// default /sys/class/nvme). Overridable so the watchdog can be tested
+/// against a plain directory.
+fn nvme_class_path() -> String {
+    var("ABE_NVME_CLASS_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/sys/class/nvme".to_string())
+}
+
+/// NVMe-oF controllers on this host that are stuck reconnecting: (name,
+/// address) of every non-PCIe controller whose state is `connecting`. The
+/// target behind such a controller is gone or unreachable, and with
+/// `ctrl_loss_tmo=off` the kernel queues I/O to its namespaces forever, so
+/// any LVM command, which scans every block device, hangs on it.
+fn dead_nvme_ctrls(root: &Path) -> Vec<(String, String)> {
+    let read = |p: PathBuf| {
+        fs::read_to_string(p)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    let mut dead = Vec::new();
+    let Ok(dir) = fs::read_dir(root) else {
+        return dead;
+    };
+    for e in dir.flatten() {
+        let p = e.path();
+        let transport = read(p.join("transport"));
+        if transport.is_empty() || transport == "pcie" {
+            continue;
+        }
+        if read(p.join("state")) != "connecting" {
+            continue;
+        }
+        dead.push((
+            e.file_name().to_string_lossy().into_owned(),
+            read(p.join("address")),
+        ));
+    }
+    dead.sort();
+    dead
+}
+
+/// Delete every controller `dead_nvme_ctrls` finds (what `nvme disconnect`
+/// does), so I/O queued on it fails and a hung LVM scan moves on. Returns
+/// how many were deleted.
+fn drop_dead_nvme_ctrls(root: &Path) -> usize {
+    let mut n = 0;
+    for (name, addr) in dead_nvme_ctrls(root) {
+        match write(root.join(&name).join("delete_controller"), "1") {
+            Ok(()) => {
+                warn!("lvm watchdog: deleted nvme controller {name} ({addr}): stuck connecting");
+                n += 1;
+            }
+            Err(e) => warn!("lvm watchdog: cannot delete nvme controller {name} ({addr}): {e}"),
+        }
+    }
+    n
+}
+
+/// `Command::output()` with an alarm: every `alarm` the command is still
+/// running, dead NVMe controllers under `nvme_root` are deleted. The command
+/// itself is never killed; it is left to finish once its I/O stops hanging.
+fn watched_output(
+    cmd: &mut Command,
+    alarm: std::time::Duration,
+    nvme_root: &Path,
+) -> Result<std::process::Output> {
+    use std::process::Stdio;
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    if alarm.is_zero() {
+        return cmd.output();
+    }
+    let what = format!("{cmd:?}");
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let started = std::time::Instant::now();
+    loop {
+        match rx.recv_timeout(alarm) {
+            Ok(out) => return out,
+            Err(RecvTimeoutError::Timeout) => {
+                let n = drop_dead_nvme_ctrls(nvme_root);
+                warn!(
+                    "lvm watchdog: {what} still running after {}s; deleted {n} dead nvme controller(s)",
+                    started.elapsed().as_secs()
+                );
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(Error::other(format!("{what}: lost the waiting thread")));
+            }
+        }
+    }
+}
+
+/// How every LVM tool is run: `output()` under the ABE_LVM_ALARM watchdog.
+trait LvmOutput {
+    fn lvm_output(&mut self) -> Result<std::process::Output>;
+}
+
+impl LvmOutput for Command {
+    fn lvm_output(&mut self) -> Result<std::process::Output> {
+        watched_output(
+            self,
+            std::time::Duration::from_secs(lvm_alarm()),
+            Path::new(&nvme_class_path()),
+        )
+    }
+}
+
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -1132,7 +1258,7 @@ fn reexport_one(
         // -K: ignore the activation-skip flag thin snapshots are born with
         let out = Command::new("/usr/sbin/lvchange")
             .args(["-y", "-ay", "-K", &format!("{}/{id}", vg_name())])
-            .output()?;
+            .lvm_output()?;
         if let Err(e) = check(out, "lvchange -ay") {
             if let Some(pool) = thin_pool() {
                 warn!(
@@ -1298,7 +1424,7 @@ fn retag(id: &str, del: &[String], add: &[String]) -> Result<()> {
         cmd.args(["--addtag", t]);
     }
     cmd.arg(format!("{}/{id}", vg_name()));
-    check(cmd.output()?, "lvchange tags")
+    check(cmd.lvm_output()?, "lvchange tags")
 }
 
 /// Record the port `id` is exported on, replacing any earlier record.
@@ -1676,7 +1802,7 @@ fn rollback_lv(id: &str) {
     }
     match Command::new("/usr/sbin/lvremove")
         .args(["-y", &lv])
-        .output()
+        .lvm_output()
     {
         Ok(o) if o.status.success() => info!("rolled back {lv}"),
         Ok(o) => warn!(
@@ -1840,7 +1966,7 @@ fn warn_if_discards_ignored() {
     let out = Command::new("/usr/sbin/lvs")
         .env("LC_ALL", "C")
         .args(["--noheadings", "-o", "discards", &format!("{vg}/{pool}")])
-        .output();
+        .lvm_output();
     match out {
         Ok(o) if o.status.success() => {
             if String::from_utf8_lossy(&o.stdout).trim() == "ignore" {
@@ -1936,7 +2062,7 @@ fn remove_volume(id: &str) -> Res<Message> {
         check(
             Command::new("/usr/sbin/lvremove")
                 .args(["-y", &lv])
-                .output()
+                .lvm_output()
                 .map_err(Fail::ctx("lvremove"))?,
             "lvremove",
         )
@@ -2087,7 +2213,7 @@ fn clone_lv(origin: &str, name: &str, grow_to: Option<u64>) -> Result<()> {
     check(
         Command::new("/usr/sbin/lvcreate")
             .args(["-y", "-s", "-n", name, &format!("{vg}/{origin}")])
-            .output()?,
+            .lvm_output()?,
         "lvcreate -s",
     )?;
     // Thin snapshots are created with the activation-skip flag set; clear it
@@ -2096,20 +2222,20 @@ fn clone_lv(origin: &str, name: &str, grow_to: Option<u64>) -> Result<()> {
         check(
             Command::new("/usr/sbin/lvchange")
                 .args(["-y", "-kn", &lv])
-                .output()?,
+                .lvm_output()?,
             "lvchange -kn",
         )?;
         check(
             Command::new("/usr/sbin/lvchange")
                 .args(["-y", "-ay", &lv])
-                .output()?,
+                .lvm_output()?,
             "lvchange -ay",
         )?;
         if let Some(b) = grow_to {
             check(
                 Command::new("/usr/sbin/lvextend")
                     .args(["-y", "-L", &bytes_to_lv_size(b), &lv])
-                    .output()?,
+                    .lvm_output()?,
                 "lvextend",
             )?;
         }
@@ -2118,7 +2244,7 @@ fn clone_lv(origin: &str, name: &str, grow_to: Option<u64>) -> Result<()> {
     if let Err(e) = finish() {
         match Command::new("/usr/sbin/lvremove")
             .args(["-y", &lv])
-            .output()
+            .lvm_output()
         {
             Ok(o) if o.status.success() => info!("removed half-made clone {lv}"),
             _ => warn!("could not remove half-made clone {lv}"),
@@ -2153,7 +2279,7 @@ fn list_lvs() -> Result<Vec<Lv>> {
             LVS_FIELDS,
             &vg_name(),
         ])
-        .output()?;
+        .lvm_output()?;
     check(out.clone(), "lvs")?;
     Ok(parse_lvs(&String::from_utf8_lossy(&out.stdout)))
 }
@@ -2210,7 +2336,7 @@ fn vg_space() -> Result<(u64, u64)> {
             "vg_size,vg_free",
             &vg_name(),
         ])
-        .output()?;
+        .lvm_output()?;
     check(out.clone(), "vgs")?;
     let text = String::from_utf8_lossy(&out.stdout);
     parse_vgs(&text)
@@ -2703,13 +2829,13 @@ pub fn create_lv(name: &str, size: &str, raw: bool) -> Result<()> {
                     "-n",
                     name,
                 ])
-                .output()?
+                .lvm_output()?
         }
         None => {
             info!("making lv {name} in {vg}");
             Command::new("/usr/sbin/lvcreate")
                 .args(["-y", "-W", "y", "-L", size, "-n", name, &vg])
-                .output()?
+                .lvm_output()?
         }
     };
 
@@ -3813,5 +3939,76 @@ table inet abe {
         let e = client_ip(v6).unwrap_err();
         assert_eq!(e.status, StatusCode::BAD_REQUEST);
         assert!(e.error.starts_with("fence needs an IPv4 client address"));
+    }
+
+    /// A fake /sys/class/nvme entry.
+    fn fake_ctrl(root: &Path, name: &str, transport: &str, state: &str) {
+        let d = root.join(name);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("transport"), format!("{transport}\n")).unwrap();
+        fs::write(d.join("state"), format!("{state}\n")).unwrap();
+        fs::write(d.join("address"), "traddr=10.0.0.1,trsvcid=23001\n").unwrap();
+        fs::write(d.join("delete_controller"), "").unwrap();
+    }
+
+    #[test]
+    fn dead_nvme_ctrls_are_fabrics_controllers_stuck_connecting() {
+        let t = TempDir::new("nvme-dead");
+        fake_ctrl(&t.0, "nvme0", "pcie", "live");
+        fake_ctrl(&t.0, "nvme1", "tcp", "connecting");
+        fake_ctrl(&t.0, "nvme2", "tcp", "live");
+        fake_ctrl(&t.0, "nvme3", "tcp", "resetting");
+        fake_ctrl(&t.0, "nvme4", "pcie", "connecting");
+        assert_eq!(
+            dead_nvme_ctrls(&t.0),
+            vec![(
+                "nvme1".to_string(),
+                "traddr=10.0.0.1,trsvcid=23001".to_string()
+            )]
+        );
+        assert!(dead_nvme_ctrls(&t.0.join("missing")).is_empty());
+    }
+
+    #[test]
+    fn watchdog_deletes_dead_ctrls_only_when_the_command_overruns() {
+        let alarm = std::time::Duration::from_millis(100);
+        let deleted = |root: &Path, name: &str| {
+            fs::read_to_string(root.join(name).join("delete_controller")).unwrap()
+        };
+
+        // Finishes inside the alarm: nothing is touched.
+        let quick = TempDir::new("nvme-quick");
+        fake_ctrl(&quick.0, "nvme1", "tcp", "connecting");
+        let out =
+            watched_output(Command::new("sh").args(["-c", "echo ok"]), alarm, &quick.0).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+        assert_eq!(deleted(&quick.0, "nvme1"), "");
+
+        // Overruns: the connecting controller is deleted, the live one is
+        // left alone, and the command's own result still comes back.
+        let slow = TempDir::new("nvme-slow");
+        fake_ctrl(&slow.0, "nvme1", "tcp", "connecting");
+        fake_ctrl(&slow.0, "nvme2", "tcp", "live");
+        let out = watched_output(
+            Command::new("sh").args(["-c", "sleep 0.5; echo done; exit 3"]),
+            alarm,
+            &slow.0,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(deleted(&slow.0, "nvme1"), "1");
+        assert_eq!(deleted(&slow.0, "nvme2"), "");
+
+        // Alarm 0: the watchdog is off.
+        let off = TempDir::new("nvme-off");
+        fake_ctrl(&off.0, "nvme1", "tcp", "connecting");
+        watched_output(
+            Command::new("sh").args(["-c", "sleep 0.3"]),
+            std::time::Duration::ZERO,
+            &off.0,
+        )
+        .unwrap();
+        assert_eq!(deleted(&off.0, "nvme1"), "");
     }
 }
