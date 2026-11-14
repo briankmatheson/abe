@@ -15,7 +15,8 @@
   with `bytes` twice in the JSON (once from the export, once from the
   clone reply); xdebbied's reader refused it (`duplicate field bytes`),
   so a VM whose first clone succeeded but whose reconcile pass was
-  retried never got its root disk. One `bytes` now; e2e re-asks a clone.
+  retried never got its root disk. One `bytes` now; e2e re-asks a clone
+  h.
 
 ## 0.5.1
 
