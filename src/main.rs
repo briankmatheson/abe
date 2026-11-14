@@ -947,14 +947,37 @@ fn reexport_wait() -> u64 {
         .unwrap_or(90)
 }
 
-/// Seconds an LVM command may run before the watchdog looks for dead NVMe
-/// controllers (ABE_LVM_ALARM, default 10; 0 turns the watchdog off). The
-/// alarm repeats at the same interval for as long as the command runs.
+/// Seconds a controller may sit in `connecting`, while an LVM command is
+/// running, before the watchdog deletes it (ABE_LVM_ALARM, default 10; 0
+/// turns the watchdog off, logging included). Capped below the kernel's
+/// NVMe I/O timeout, see `lvm_deadline`.
 fn lvm_alarm() -> u64 {
     var("ABE_LVM_ALARM")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10)
+}
+
+/// How often the watchdog looks while an LVM command is running.
+const LVM_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Seconds the watchdog keeps clear of the kernel's NVMe I/O timeout.
+const LVM_IO_MARGIN: u64 = 5;
+
+/// The kernel's NVMe I/O timeout in seconds
+/// (/sys/module/nvme_core/parameters/io_timeout; 30 when unreadable).
+fn nvme_io_timeout() -> u64 {
+    fs::read_to_string("/sys/module/nvme_core/parameters/io_timeout")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(30)
+}
+
+/// When the watchdog acts: `alarm` seconds, but always at least
+/// LVM_IO_MARGIN seconds before I/O queued behind a hung scan would hit
+/// `io_timeout`, and never under one second.
+fn lvm_deadline(alarm: u64, io_timeout: u64) -> u64 {
+    alarm.min(io_timeout.saturating_sub(LVM_IO_MARGIN)).max(1)
 }
 
 /// Where the kernel lists this host's NVMe controllers (ABE_NVME_CLASS_PATH,
@@ -967,67 +990,175 @@ fn nvme_class_path() -> String {
         .unwrap_or_else(|| "/sys/class/nvme".to_string())
 }
 
-/// NVMe-oF controllers on this host that are stuck reconnecting: (name,
-/// address) of every non-PCIe controller whose state is `connecting`. The
-/// target behind such a controller is gone or unreachable, and with
-/// `ctrl_loss_tmo=off` the kernel queues I/O to its namespaces forever, so
-/// any LVM command, which scans every block device, hangs on it.
-fn dead_nvme_ctrls(root: &Path) -> Vec<(String, String)> {
+/// One NVMe-oF (non-PCIe) controller on this host, as sysfs describes it.
+#[derive(Debug, Clone, PartialEq)]
+struct NvmeCtrl {
+    name: String,
+    state: String,
+    address: String,
+    nqn: String,
+    ctrl_loss_tmo: String,
+    reconnect_delay: String,
+    /// Block devices of its namespaces (`nvme1n1`), as /dev names.
+    namespaces: Vec<String>,
+}
+
+impl NvmeCtrl {
+    /// One-line description for the log.
+    fn describe(&self) -> String {
+        format!(
+            "{} {} ({} nqn={} ctrl_loss_tmo={} reconnect_delay={} namespaces={:?})",
+            self.name,
+            self.state,
+            self.address,
+            self.nqn,
+            self.ctrl_loss_tmo,
+            self.reconnect_delay,
+            self.namespaces
+        )
+    }
+}
+
+/// Every NVMe-oF controller under `root`, sorted by name. PCIe controllers
+/// are local disks and are left out.
+fn nvme_fabrics_ctrls(root: &Path) -> Vec<NvmeCtrl> {
     let read = |p: PathBuf| {
         fs::read_to_string(p)
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
     };
-    let mut dead = Vec::new();
+    let mut ctrls = Vec::new();
     let Ok(dir) = fs::read_dir(root) else {
-        return dead;
+        return ctrls;
     };
     for e in dir.flatten() {
         let p = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
         let transport = read(p.join("transport"));
         if transport.is_empty() || transport == "pcie" {
             continue;
         }
-        if read(p.join("state")) != "connecting" {
+        // The namespace entry is nvme1c1n1 under multipath, nvme1n1 without;
+        // the block device is nvme1n1 either way.
+        let mut namespaces: Vec<String> = fs::read_dir(&p)
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|n| {
+                        let n = n.file_name().to_string_lossy().into_owned();
+                        let rest = n.strip_prefix(&name)?;
+                        let ns = match rest.split_once('n') {
+                            Some(("", ns)) => ns,
+                            Some((c, ns)) if c.starts_with('c') => ns,
+                            _ => return None,
+                        };
+                        ns.parse::<u32>().ok().map(|ns| format!("{name}n{ns}"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        namespaces.sort();
+        ctrls.push(NvmeCtrl {
+            state: read(p.join("state")),
+            address: read(p.join("address")),
+            nqn: read(p.join("subsysnqn")),
+            ctrl_loss_tmo: read(p.join("ctrl_loss_tmo")),
+            reconnect_delay: read(p.join("reconnect_delay")),
+            namespaces,
+            name,
+        });
+    }
+    ctrls.sort_by(|a, b| a.name.cmp(&b.name));
+    ctrls
+}
+
+/// `comm[pid]` of every process holding one of `devs` (/dev names) open,
+/// from /proc/*/fd. Best effort: what cannot be read is skipped.
+fn dev_openers(devs: &[String]) -> Vec<String> {
+    let mut who = BTreeSet::new();
+    if devs.is_empty() {
+        return Vec::new();
+    }
+    let Ok(procs) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for p in procs.flatten() {
+        let pid = p.file_name().to_string_lossy().into_owned();
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        dead.push((
-            e.file_name().to_string_lossy().into_owned(),
-            read(p.join("address")),
-        ));
-    }
-    dead.sort();
-    dead
-}
-
-/// Delete every controller `dead_nvme_ctrls` finds (what `nvme disconnect`
-/// does), so I/O queued on it fails and a hung LVM scan moves on. Returns
-/// how many were deleted.
-fn drop_dead_nvme_ctrls(root: &Path) -> usize {
-    let mut n = 0;
-    for (name, addr) in dead_nvme_ctrls(root) {
-        match write(root.join(&name).join("delete_controller"), "1") {
-            Ok(()) => {
-                warn!("lvm watchdog: deleted nvme controller {name} ({addr}): stuck connecting");
-                n += 1;
-            }
-            Err(e) => warn!("lvm watchdog: cannot delete nvme controller {name} ({addr}): {e}"),
+        let Ok(fds) = fs::read_dir(p.path().join("fd")) else {
+            continue;
+        };
+        let open = fds.flatten().any(|fd| {
+            fs::read_link(fd.path())
+                .ok()
+                .and_then(|t| t.strip_prefix("/dev").ok().map(|d| d.to_path_buf()))
+                .is_some_and(|d| devs.iter().any(|want| Path::new(want) == d))
+        });
+        if open {
+            let comm = fs::read_to_string(p.path().join("comm")).unwrap_or_default();
+            who.insert(format!("{}[{pid}]", comm.trim()));
         }
     }
-    n
+    who.into_iter().collect()
 }
 
-/// `Command::output()` with an alarm: every `alarm` the command is still
-/// running, dead NVMe controllers under `nvme_root` are deleted. The command
-/// itself is never killed; it is left to finish once its I/O stops hanging.
+/// What a running process is doing, for the log: its scheduler state (`D`
+/// is uninterruptible I/O wait), the devices it has open and the top of its
+/// kernel stack (root only; empty when unreadable).
+fn proc_detail(pid: u32) -> (String, Vec<String>, String) {
+    let state = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_string))
+        })
+        .unwrap_or_else(|| "?".to_string());
+    let mut devs: Vec<String> = fs::read_dir(format!("/proc/{pid}/fd"))
+        .map(|d| {
+            d.flatten()
+                .filter_map(|fd| fs::read_link(fd.path()).ok())
+                .map(|t| t.to_string_lossy().into_owned())
+                .filter(|t| t.starts_with("/dev/") && t != "/dev/null")
+                .collect()
+        })
+        .unwrap_or_default();
+    devs.sort();
+    devs.dedup();
+    let stack = fs::read_to_string(format!("/proc/{pid}/stack"))
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| l.split_whitespace().nth(1))
+                .map(|f| f.split('+').next().unwrap_or(f))
+                .take(8)
+                .collect::<Vec<_>>()
+                .join(" < ")
+        })
+        .unwrap_or_default();
+    (state, devs, stack)
+}
+
+/// `Command::output()` under the LVM watchdog.
+///
+/// LVM scans every block device. An NVMe-oF controller whose target is gone
+/// sits in `connecting` and (with `ctrl_loss_tmo=off`) queues I/O forever,
+/// so the scan, the command and abe behind it hang.
+///
+/// Every `tick` the command is still running the watchdog logs what it is
+/// doing (state, open devices, kernel stack when it changes) and every
+/// controller that is not `live`, with how long it has been seen that way.
+/// A controller seen `connecting` on every tick for `deadline` is deleted
+/// (what `nvme disconnect` does), so the queued I/O fails and the scan moves
+/// on. The command itself is never killed.
 fn watched_output(
     cmd: &mut Command,
-    alarm: std::time::Duration,
+    tick: std::time::Duration,
+    deadline: std::time::Duration,
     nvme_root: &Path,
 ) -> Result<std::process::Output> {
     use std::process::Stdio;
     use std::sync::mpsc::{channel, RecvTimeoutError};
-    if alarm.is_zero() {
+    if deadline.is_zero() || tick.is_zero() {
         return cmd.output();
     }
     let what = format!("{cmd:?}");
@@ -1036,38 +1167,109 @@ fn watched_output(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let pid = child.id();
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
     let started = std::time::Instant::now();
+    // controller -> consecutive ticks seen `connecting`
+    let mut connecting: BTreeMap<String, u32> = BTreeMap::new();
+    let mut deleted: BTreeSet<String> = BTreeSet::new();
+    let mut last_stack = String::new();
+    let need = (deadline.as_millis() / tick.as_millis().max(1)).max(1) as u32;
     loop {
-        match rx.recv_timeout(alarm) {
-            Ok(out) => return out,
-            Err(RecvTimeoutError::Timeout) => {
-                let n = drop_dead_nvme_ctrls(nvme_root);
-                warn!(
-                    "lvm watchdog: {what} still running after {}s; deleted {n} dead nvme controller(s)",
-                    started.elapsed().as_secs()
-                );
+        match rx.recv_timeout(tick) {
+            Ok(out) => {
+                if started.elapsed() >= tick {
+                    warn!(
+                        "lvm watchdog: {what} finished after {:.1}s",
+                        started.elapsed().as_secs_f32()
+                    );
+                }
+                return out;
             }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(Error::other(format!("{what}: lost the waiting thread")));
+            }
+        }
+        let ran = started.elapsed().as_secs_f32();
+        let (state, devs, stack) = proc_detail(pid);
+        let ctrls = nvme_fabrics_ctrls(nvme_root);
+        let not_live: Vec<&NvmeCtrl> = ctrls.iter().filter(|c| c.state != "live").collect();
+        connecting.retain(|name, _| {
+            not_live
+                .iter()
+                .any(|c| &c.name == name && c.state == "connecting")
+        });
+        for c in not_live.iter().filter(|c| c.state == "connecting") {
+            *connecting.entry(c.name.clone()).or_insert(0) += 1;
+        }
+        warn!(
+            "lvm watchdog: {what} running {ran:.1}s: pid {pid} state {state}, open {devs:?}, {} of {} nvme-of controllers not live{}",
+            not_live.len(),
+            ctrls.len(),
+            if not_live.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ": {}",
+                    not_live
+                        .iter()
+                        .map(|c| match connecting.get(&c.name) {
+                            Some(n) => format!("{} for {n} tick(s)", c.describe()),
+                            None => c.describe(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            }
+        );
+        if !stack.is_empty() && stack != last_stack {
+            warn!("lvm watchdog: pid {pid} kernel stack: {stack}");
+            last_stack = stack;
+        }
+        for c in &not_live {
+            if connecting.get(&c.name).copied().unwrap_or(0) < need || deleted.contains(&c.name) {
+                continue;
+            }
+            let openers = dev_openers(&c.namespaces);
+            match write(nvme_root.join(&c.name).join("delete_controller"), "1") {
+                Ok(()) => {
+                    warn!(
+                        "lvm watchdog: deleted nvme controller {}: connecting for {need} tick(s) while {what} ran {ran:.1}s; namespaces open by {openers:?}",
+                        c.describe()
+                    );
+                    deleted.insert(c.name.clone());
+                }
+                Err(e) => warn!(
+                    "lvm watchdog: cannot delete nvme controller {}: {e}",
+                    c.describe()
+                ),
             }
         }
     }
 }
 
-/// How every LVM tool is run: `output()` under the ABE_LVM_ALARM watchdog.
+/// How every LVM tool is run: `output()` under the watchdog, looking every
+/// LVM_TICK and acting at `lvm_deadline`.
 trait LvmOutput {
     fn lvm_output(&mut self) -> Result<std::process::Output>;
 }
 
 impl LvmOutput for Command {
     fn lvm_output(&mut self) -> Result<std::process::Output> {
+        let alarm = lvm_alarm();
+        let deadline = if alarm == 0 {
+            0
+        } else {
+            lvm_deadline(alarm, nvme_io_timeout())
+        };
         watched_output(
             self,
-            std::time::Duration::from_secs(lvm_alarm()),
+            LVM_TICK,
+            std::time::Duration::from_secs(deadline),
             Path::new(&nvme_class_path()),
         )
     }
@@ -3941,57 +4143,81 @@ table inet abe {
         assert!(e.error.starts_with("fence needs an IPv4 client address"));
     }
 
-    /// A fake /sys/class/nvme entry.
+    /// A fake /sys/class/nvme entry with one namespace.
     fn fake_ctrl(root: &Path, name: &str, transport: &str, state: &str) {
         let d = root.join(name);
-        fs::create_dir_all(&d).unwrap();
+        fs::create_dir_all(d.join(format!("{name}c1n1"))).unwrap();
         fs::write(d.join("transport"), format!("{transport}\n")).unwrap();
         fs::write(d.join("state"), format!("{state}\n")).unwrap();
         fs::write(d.join("address"), "traddr=10.0.0.1,trsvcid=23001\n").unwrap();
+        fs::write(d.join("subsysnqn"), "0123abcd\n").unwrap();
+        fs::write(d.join("ctrl_loss_tmo"), "off\n").unwrap();
+        fs::write(d.join("reconnect_delay"), "10\n").unwrap();
         fs::write(d.join("delete_controller"), "").unwrap();
     }
 
     #[test]
-    fn dead_nvme_ctrls_are_fabrics_controllers_stuck_connecting() {
-        let t = TempDir::new("nvme-dead");
+    fn nvme_fabrics_ctrls_reads_sysfs_and_skips_pcie() {
+        let t = TempDir::new("nvme-list");
         fake_ctrl(&t.0, "nvme0", "pcie", "live");
-        fake_ctrl(&t.0, "nvme1", "tcp", "connecting");
+        fake_ctrl(&t.0, "nvme10", "tcp", "connecting");
         fake_ctrl(&t.0, "nvme2", "tcp", "live");
-        fake_ctrl(&t.0, "nvme3", "tcp", "resetting");
-        fake_ctrl(&t.0, "nvme4", "pcie", "connecting");
+        let c = nvme_fabrics_ctrls(&t.0);
         assert_eq!(
-            dead_nvme_ctrls(&t.0),
-            vec![(
-                "nvme1".to_string(),
-                "traddr=10.0.0.1,trsvcid=23001".to_string()
-            )]
+            c.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["nvme10", "nvme2"]
         );
-        assert!(dead_nvme_ctrls(&t.0.join("missing")).is_empty());
+        assert_eq!(c[0].state, "connecting");
+        assert_eq!(c[0].namespaces, ["nvme10n1"]);
+        assert_eq!(c[0].ctrl_loss_tmo, "off");
+        assert!(c[0].describe().contains("trsvcid=23001"));
+        assert!(nvme_fabrics_ctrls(&t.0.join("missing")).is_empty());
     }
 
     #[test]
-    fn watchdog_deletes_dead_ctrls_only_when_the_command_overruns() {
-        let alarm = std::time::Duration::from_millis(100);
+    fn lvm_deadline_stays_under_the_io_timeout() {
+        assert_eq!(lvm_deadline(10, 30), 10);
+        assert_eq!(lvm_deadline(60, 30), 25);
+        assert_eq!(lvm_deadline(10, 8), 3);
+        assert_eq!(lvm_deadline(10, 3), 1);
+    }
+
+    #[test]
+    fn watchdog_deletes_only_ctrls_connecting_for_the_whole_deadline() {
+        let ms = std::time::Duration::from_millis;
         let deleted = |root: &Path, name: &str| {
             fs::read_to_string(root.join(name).join("delete_controller")).unwrap()
         };
+        let sh = |script: &str| {
+            let mut c = Command::new("sh");
+            c.args(["-c", script]);
+            c
+        };
 
-        // Finishes inside the alarm: nothing is touched.
+        // Finishes inside the first tick: nothing is touched.
         let quick = TempDir::new("nvme-quick");
         fake_ctrl(&quick.0, "nvme1", "tcp", "connecting");
-        let out =
-            watched_output(Command::new("sh").args(["-c", "echo ok"]), alarm, &quick.0).unwrap();
+        let out = watched_output(&mut sh("echo ok"), ms(50), ms(200), &quick.0).unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
         assert_eq!(deleted(&quick.0, "nvme1"), "");
 
-        // Overruns: the connecting controller is deleted, the live one is
-        // left alone, and the command's own result still comes back.
+        // Overruns the tick but not the deadline: watched, not touched.
+        let short = TempDir::new("nvme-short");
+        fake_ctrl(&short.0, "nvme1", "tcp", "connecting");
+        watched_output(&mut sh("sleep 0.12"), ms(50), ms(400), &short.0).unwrap();
+        assert_eq!(deleted(&short.0, "nvme1"), "");
+
+        // Overruns the deadline: the controller that was connecting all
+        // along is deleted; a live one and one merely resetting are not; the
+        // command's own result still comes back.
         let slow = TempDir::new("nvme-slow");
         fake_ctrl(&slow.0, "nvme1", "tcp", "connecting");
         fake_ctrl(&slow.0, "nvme2", "tcp", "live");
+        fake_ctrl(&slow.0, "nvme3", "tcp", "resetting");
         let out = watched_output(
-            Command::new("sh").args(["-c", "sleep 0.5; echo done; exit 3"]),
-            alarm,
+            &mut sh("sleep 0.6; echo done; exit 3"),
+            ms(50),
+            ms(200),
             &slow.0,
         )
         .unwrap();
@@ -3999,16 +4225,37 @@ table inet abe {
         assert_eq!(out.status.code(), Some(3));
         assert_eq!(deleted(&slow.0, "nvme1"), "1");
         assert_eq!(deleted(&slow.0, "nvme2"), "");
+        assert_eq!(deleted(&slow.0, "nvme3"), "");
 
-        // Alarm 0: the watchdog is off.
-        let off = TempDir::new("nvme-off");
-        fake_ctrl(&off.0, "nvme1", "tcp", "connecting");
-        watched_output(
-            Command::new("sh").args(["-c", "sleep 0.3"]),
-            std::time::Duration::ZERO,
-            &off.0,
+        // A controller that recovers before the deadline is left alone: it
+        // goes live after ~150 ms of a 400 ms deadline.
+        let blip = TempDir::new("nvme-blip");
+        fake_ctrl(&blip.0, "nvme1", "tcp", "connecting");
+        let state = blip.0.join("nvme1").join("state");
+        let out = watched_output(
+            &mut sh(&format!(
+                "sleep 0.15; echo live > {}; sleep 0.75",
+                state.display()
+            )),
+            ms(50),
+            ms(400),
+            &blip.0,
         )
         .unwrap();
+        assert!(out.status.success());
+        assert_eq!(deleted(&blip.0, "nvme1"), "");
+
+        // Deadline 0: the watchdog is off.
+        let off = TempDir::new("nvme-off");
+        fake_ctrl(&off.0, "nvme1", "tcp", "connecting");
+        watched_output(&mut sh("sleep 0.3"), ms(50), ms(0), &off.0).unwrap();
         assert_eq!(deleted(&off.0, "nvme1"), "");
+    }
+
+    #[test]
+    fn proc_detail_reports_state_and_open_devices() {
+        let (state, _devs, _stack) = proc_detail(std::process::id());
+        assert!(["R", "S"].contains(&state.as_str()), "{state}");
+        assert_eq!(proc_detail(u32::MAX).0, "?");
     }
 }

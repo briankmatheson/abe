@@ -52,7 +52,7 @@ Configuration is by environment (see `debian/abe.default`, installed as
 | `ABE_PORT_MIN` | `23000` | lowest nvmet TCP port handed to exports |
 | `ABE_PORT_MAX` | `23999` | highest; abe refuses to start unless `1 <= min <= max <= 65535` |
 | `ABE_REEXPORT_WAIT` | `90` | seconds startup waits for the underlay address before serving anyway |
-| `ABE_LVM_ALARM` | `10` | seconds an LVM command may run before abe deletes NVMe-oF controllers stuck `connecting` on this host (repeats while it runs; `0` = off) |
+| `ABE_LVM_ALARM` | `10` | while an LVM command runs abe looks every second and logs what it sees; an NVMe-oF controller on this host seen `connecting` for this many seconds in a row is deleted (capped 5 s under the kernel NVMe `io_timeout`; `0` = off) |
 | `ABE_FIO_SECONDS` | `5` | seconds of fio writes on each new volume (0: off) |
 | `ABE_FIO_RAMP` | `3` | seconds of unmeasured fio warm-up before that |
 | `ABE_FIO_BS` | `4k` | fio block size |
