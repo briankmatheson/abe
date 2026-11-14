@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 - LVM watchdog: an LVM command still running after `ABE_LVM_ALARM`
   seconds (default 10) makes abe delete every NVMe-oF controller on the

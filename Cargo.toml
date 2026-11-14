@@ -1,6 +1,6 @@
 [package]
 name = "abe"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 description = "Abe Block Exporter: NVMe-oF/TCP volumes from an LVM thin pool, with an HTTP API"
 license = "GPL-3.0-or-later"
