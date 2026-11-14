@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.1
+
+- LVM watchdog reworked. 0.6.0 deleted any controller that was
+  `connecting` at the moment its 10 s alarm fired; on timesink that
+  removed the root disk of a running VM seconds after abe started.
+  Now, while an LVM command runs, abe looks every second and deletes a
+  controller only after seeing it `connecting` on every look for
+  `ABE_LVM_ALARM` seconds (default 10). One that recovers in between
+  is left alone.
+- The deadline is capped 5 s under the kernel NVMe `io_timeout`
+  (`/sys/module/nvme_core/parameters/io_timeout`, usually 30 s),
+  whatever `ABE_LVM_ALARM` says.
+- Every look is logged at WARN: the command, how long it has run, its
+  pid, scheduler state and open devices; its kernel stack when that
+  changes; and every NVMe-oF controller that is not `live` (state,
+  address, nqn, `ctrl_loss_tmo`, `reconnect_delay`, namespaces, how
+  long it has been `connecting`). A deletion also logs which processes
+  had the controller's namespaces open, and a command that ran over a
+  second logs how long it took.
+
 ## 0.6.0
 
 - LVM watchdog: an LVM command still running after `ABE_LVM_ALARM`
