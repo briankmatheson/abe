@@ -49,13 +49,13 @@
 
 Create `/etc/abe/config.toml`:
 ```toml
-listen_addr = "0.0.0.0:7080"
+listen_addr = "0.0.0.0:443"
 volume_group = "abe"
 token_file = "/etc/abe/token"
 default_size_gib = 10
 max_size_gib = 1000
-port_range_start = 4420
-port_range_end = 4520
+port_range_start = 23000
+port_range_end = 23999
 ```
 
 ## Setup on XDebbie VM with Data Disk
@@ -67,9 +67,9 @@ write_files:
   - path: /etc/abe/config.toml
     content: |
       volume_group = "abe"
-      listen_addr = "0.0.0.0:7080"
-      port_range_start = 4420
-      port_range_end = 4520
+      listen_addr = "0.0.0.0:443"
+      port_range_start = 23000
+      port_range_end = 23999
   - path: /etc/abe/token
     permissions: '0600'
     content: |
@@ -122,7 +122,7 @@ WantedBy=multi-user.target
 ```bash
 TOKEN=$(cat /etc/abe/token)
 
-curl -X POST http://abe-server:7080/volumes \
+curl -X POST https://abe-server/volumes \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"size_gib": 50}'
@@ -133,43 +133,43 @@ Response:
 {
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "size_gib": 50,
-  "nvme_port": 4420,
-  "connect_command": "sudo nvme discover -a 10.23.0.100 -t tcp -s 4420 && sudo nvme connect -a 10.23.0.100 -t tcp -s 4420 -n 550e8400-e29b-41d4-a716-446655440000"
+  "nvme_port": 23000,
+  "connect_command": "sudo nvme discover -a 10.23.0.100 -t tcp -s 23000 && sudo nvme connect -a 10.23.0.100 -t tcp -s 23000 -n 550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
 ### List Volumes
 ```bash
-curl http://abe-server:7080/volumes \
+curl https://abe-server/volumes \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 ### Delete Volume
 ```bash
-curl -X DELETE http://abe-server:7080/volumes/550e8400-e29b-41d4-a716-446655440000 \
+curl -X DELETE https://abe-server/volumes/550e8400-e29b-41d4-a716-446655440000 \
   -H "Authorization: Bearer $TOKEN"
 ```
 
 ### Health Check (no auth)
 ```bash
-curl http://abe-server:7080/health
+curl https://abe-server/health
 ```
 
 ## Testing Security
 
 ```bash
 # Should fail - no auth
-curl http://abe-server:7080/volumes
+curl https://abe-server/volumes
 
 # Should fail - wrong token
-curl -H "Authorization: Bearer wrong" http://abe-server:7080/volumes
+curl -H "Authorization: Bearer wrong" https://abe-server/volumes
 
 # Should fail - invalid UUID
-curl -X GET http://abe-server:7080/volumes/../etc/passwd \
+curl -X GET https://abe-server/volumes/../etc/passwd \
   -H "Authorization: Bearer $TOKEN"
 
 # Should succeed
-curl -H "Authorization: Bearer $TOKEN" http://abe-server:7080/volumes
+curl -H "Authorization: Bearer $TOKEN" https://abe-server/volumes
 ```
 
 ## TODO
