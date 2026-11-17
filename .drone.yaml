@@ -1,18 +1,56 @@
-# Drone port of .github/workflows/ci.yml (kube runner on w4).
+---
+# Drone (aviary-drone on w10). `ci` ports .github/workflows/ci.yml; on a tag,
+# `package` also builds the .deb and publishes it to the xdebbie apt
+# repository (https://apt.xdebbie.org) with apt-publish from the xdebbie
+# builder image. Publishing mounts the Kubernetes Secrets apt-publish and
+# apt-signing from aviary-drone-builds, so this repo must be Trusted in Drone.
 kind: pipeline
 type: kubernetes
 name: ci
 
 trigger:
-  event: [push, pull_request]
+  event: [push, pull_request, tag, custom]
+
+clone:
+  skip_verify: true
+
+environment:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_TERM_COLOR: never
 
 steps:
   - name: test
-    image: rust:1
+    image: registry.mesh.bmath.nyc/xdebbie-builder:2
+    resources:
+      limits:
+        memory: 2560MiB
     commands:
-      - apt-get update -qq && apt-get install -y -qq cmake
-      - rustup component add rustfmt clippy
       - cargo fmt --check
       - cargo clippy --all-targets -- -D warnings
       - cargo test
       - tests/lint-links.sh
+
+  - name: package
+    image: registry.mesh.bmath.nyc/xdebbie-builder:2
+    volumes:
+      - name: apt-publish
+        path: /secrets/apt
+      - name: apt-signing
+        path: /secrets/apt-signing
+    resources:
+      limits:
+        memory: 2560MiB
+    commands:
+      - cargo deb
+      - apt-publish target/debian/*.deb
+    when:
+      event: [tag]
+    depends_on: [test]
+
+volumes:
+  - name: apt-publish
+    secret:
+      name: apt-publish
+  - name: apt-signing
+    secret:
+      name: apt-signing
