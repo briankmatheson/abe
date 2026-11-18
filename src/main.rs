@@ -1995,6 +1995,63 @@ fn export_new(id: &str, tags: &[String], client: Ipv4Addr) -> Res<(Message, u16)
     Ok((m, port))
 }
 
+/// Measure the drive for the IOPS arbiter: a scratch LV, ABE_QOS_FIO_SECONDS
+/// (30, after 5 s of warm-up) of 4k random writes at iodepth 32 from 4 jobs,
+/// the LV removed again. Total write IOPS. The LV is made and removed under
+/// OPS; fio runs outside it.
+pub fn measure_drive() -> Result<f64> {
+    const LV: &str = "abe-qos-probe";
+    let secs = var("ABE_QOS_FIO_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(30);
+    with_ops(|| {
+        rollback_lv(LV); // a probe left behind by an interrupted run
+        create_lv(LV, "4G", true)
+    })?;
+    let dev = lv_path_for_uuid(LV);
+    info!("qos: measuring the drive: {secs}s of 4k random writes, iodepth 32, 4 jobs, on {dev}");
+    let out = Command::new("fio")
+        .args([
+            "--name=abe-qos",
+            "--filename",
+            &dev,
+            "--rw=randwrite",
+            "--bs=4k",
+            "--iodepth=32",
+            "--numjobs=4",
+            "--group_reporting",
+            "--direct=1",
+            "--ioengine=libaio",
+            "--time_based",
+            "--ramp_time=5",
+            "--runtime",
+            &secs.to_string(),
+            "--output-format=json",
+        ])
+        .output();
+    let thin = thin_pool().is_some();
+    let size = 4u64 << 30;
+    let _ = trim(
+        &dev,
+        Region {
+            offset: 0,
+            len: size,
+        },
+        thin,
+    );
+    with_ops(|| {
+        rollback_lv(LV);
+        Ok::<(), Error>(())
+    })?;
+    let out = out?;
+    check(out.clone(), "fio")?;
+    let perf = parse_fio(&String::from_utf8_lossy(&out.stdout), "4k", 32)
+        .ok_or_else(|| Error::other("fio printed no write results"))?;
+    Ok(perf.write_iops)
+}
+
 /// Best effort `lvremove` of a volume whose creation failed half-way.
 fn rollback_lv(id: &str) {
     let lv = lv_path_for_uuid(id);
@@ -3146,7 +3203,7 @@ async fn main() {
 
     // The IOPS arbiter: shares the drive between the exports (off without
     // ABE_IOPS_CAPACITY); initiators read their ceilings from /qos/<id>.
-    qos::spawn(nvmet_path());
+    qos::spawn(nvmet_path(), measure_drive);
 
     let app = Router::new()
         .route("/id/:id", get(attach).delete(detach))

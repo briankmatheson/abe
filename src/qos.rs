@@ -25,8 +25,13 @@
 //! Demand is read from the kernel's per-device counters
 //! (`/sys/block/dm-N/stat`, reads + writes completed) of each exported LV.
 //! A volume is active when it did any I/O in the last `ACTIVE_WINDOW`
-//! samples. Without `ABE_IOPS_CAPACITY` the arbiter is off and `/qos`
-//! reports every volume unshaped.
+//! samples.
+//!
+//! The drive's capacity C: `ABE_IOPS_CAPACITY`, else what abe measured on
+//! its first run and recorded (`ABE_QOS_RECORD`, /var/lib/abe/drive.json):
+//! fio on a scratch LV, 4k random writes at iodepth 32 from 4 jobs. Delete
+//! the record to measure again; `ABE_QOS_MEASURE=0` never measures. Until C
+//! is known nothing is shaped.
 
 use log::{info, warn};
 use serde::Serialize;
@@ -52,24 +57,26 @@ pub struct Params {
     pub ceiling_pct: f64,
 }
 
+fn env_num(k: &str) -> Option<f64> {
+    var(k)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+}
+
 impl Params {
+    /// ABE_IOPS_CAPACITY alone (the arbiter itself also tries the record,
+    /// then measures: `capacity`).
+    #[cfg(test)]
     pub fn from_env() -> Option<Self> {
-        let num = |k: &str, d: f64| -> f64 {
-            var(k)
-                .ok()
-                .and_then(|v| v.trim().parse::<f64>().ok())
-                .filter(|v| *v > 0.0)
-                .unwrap_or(d)
-        };
-        let capacity = num("ABE_IOPS_CAPACITY", 0.0);
-        if capacity <= 0.0 {
-            return None;
-        }
-        Some(Self {
+        env_num("ABE_IOPS_CAPACITY").map(Self::with_capacity)
+    }
+    pub fn with_capacity(capacity: f64) -> Self {
+        Self {
             capacity,
-            guarantee_pct: num("ABE_QOS_GUARANTEE_PCT", 33.0).min(100.0),
-            ceiling_pct: num("ABE_QOS_CEILING_PCT", 80.0).min(100.0),
-        })
+            guarantee_pct: env_num("ABE_QOS_GUARANTEE_PCT").unwrap_or(33.0).min(100.0),
+            ceiling_pct: env_num("ABE_QOS_CEILING_PCT").unwrap_or(80.0).min(100.0),
+        }
     }
     fn total(&self) -> f64 {
         self.capacity * self.ceiling_pct / 100.0
@@ -236,9 +243,11 @@ impl Sampler {
 
 #[derive(Serialize, Clone, Default)]
 pub struct Report {
-    /// false: no ABE_IOPS_CAPACITY, nothing is shaped
+    /// false: no capacity known (yet), nothing is shaped
     pub enabled: bool,
     pub capacity_iops: u64,
+    /// where capacity_iops came from: "ABE_IOPS_CAPACITY", "measured <when>"
+    pub capacity_source: String,
     pub total_ceiling_iops: u64,
     pub contended: bool,
     pub volumes: BTreeMap<String, Alloc>,
@@ -253,22 +262,111 @@ pub fn report() -> Report {
     state().lock().unwrap().clone()
 }
 
-/// Start the arbiter (a no-op without ABE_IOPS_CAPACITY).
-pub fn spawn(nvmet: String) {
-    let Some(p) = Params::from_env() else {
-        info!("qos: ABE_IOPS_CAPACITY unset, exports are not shaped");
-        return;
+// ---------- the drive's capacity ----------
+
+/// Where the first-run measurement is kept (ABE_QOS_RECORD).
+fn record_path() -> String {
+    var("ABE_QOS_RECORD")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/var/lib/abe/drive.json".into())
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct Record {
+    capacity_iops: f64,
+    measured_at: String,
+    how: String,
+}
+
+fn load_record() -> Option<Record> {
+    serde_json::from_str(&fs::read_to_string(record_path()).ok()?).ok()
+}
+
+fn save_record(iops: f64) -> std::io::Result<Record> {
+    let r = Record {
+        capacity_iops: iops.round(),
+        measured_at: chrono::Utc::now().to_rfc3339(),
+        how: "fio: 4k random writes, iodepth 32, 4 jobs, direct, on a scratch LV".into(),
     };
+    let p = record_path();
+    if let Some(d) = Path::new(&p).parent() {
+        fs::create_dir_all(d)?;
+    }
+    fs::write(&p, serde_json::to_vec_pretty(&r)?)?;
+    Ok(r)
+}
+
+/// The drive's IOPS: ABE_IOPS_CAPACITY, else the recorded first-run
+/// measurement, else measure now (once, then recorded) unless
+/// ABE_QOS_MEASURE=0. Delete the record to measure again.
+async fn capacity(measure: fn() -> std::io::Result<f64>) -> Option<(f64, String)> {
+    if let Some(c) = env_num("ABE_IOPS_CAPACITY") {
+        return Some((c, "ABE_IOPS_CAPACITY".into()));
+    }
+    if let Some(r) = load_record() {
+        return Some((r.capacity_iops, format!("measured {}", r.measured_at)));
+    }
+    if var("ABE_QOS_MEASURE").is_ok_and(|v| v == "0") {
+        info!("qos: no ABE_IOPS_CAPACITY, no record and ABE_QOS_MEASURE=0: exports are not shaped");
+        return None;
+    }
+    match tokio::task::spawn_blocking(measure).await {
+        Ok(Ok(iops)) if iops > 0.0 => match save_record(iops) {
+            Ok(r) => {
+                info!(
+                    "qos: the drive does {:.0} IOPS; recorded in {}",
+                    iops,
+                    record_path()
+                );
+                Some((r.capacity_iops, format!("measured {}", r.measured_at)))
+            }
+            Err(e) => {
+                warn!(
+                    "qos: measured {iops:.0} IOPS but could not record it in {}: {e}",
+                    record_path()
+                );
+                Some((iops, "measured (not recorded)".into()))
+            }
+        },
+        Ok(Ok(_)) => {
+            warn!("qos: the measurement came back empty; exports are not shaped");
+            None
+        }
+        Ok(Err(e)) => {
+            warn!("qos: could not measure the drive ({e}); exports are not shaped. Set ABE_IOPS_CAPACITY");
+            None
+        }
+        Err(e) => {
+            warn!("qos: measurement task: {e}");
+            None
+        }
+    }
+}
+
+/// Start the arbiter: find the drive's capacity (measuring it on the first
+/// run), then shape every interval. Not shaping meanwhile, or at all if no
+/// capacity can be had.
+pub fn spawn(nvmet: String, measure: fn() -> std::io::Result<f64>) {
+    tokio::spawn(async move {
+        let Some((cap, source)) = capacity(measure).await else {
+            return;
+        };
+        run(nvmet, Params::with_capacity(cap), source).await;
+    });
+}
+
+async fn run(nvmet: String, p: Params, source: String) {
     let secs = var("ABE_QOS_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(5);
     info!(
-        "qos: {} IOPS drive; volumes together at most {}%, each at most {}%, guarantees together at most {}%; every {secs}s",
+        "qos: {} IOPS drive ({source}); volumes together at most {}%, each at most {}%, guarantees together at most {}%; every {secs}s",
         p.capacity, p.ceiling_pct, p.ceiling_pct, p.guarantee_pct
     );
-    tokio::spawn(async move {
+    {
         let mut s = Sampler {
             last: BTreeMap::new(),
             recent: BTreeMap::new(),
@@ -306,12 +404,13 @@ pub fn spawn(nvmet: String) {
             *state().lock().unwrap() = Report {
                 enabled: true,
                 capacity_iops: p.capacity.round() as u64,
+                capacity_source: source.clone(),
                 total_ceiling_iops: p.total().round() as u64,
                 contended,
                 volumes,
             };
         }
-    });
+    }
 }
 
 #[cfg(test)]

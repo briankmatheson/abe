@@ -52,12 +52,16 @@
 # capped 5 seconds under the kernel's NVMe io_timeout.
 #ABE_LVM_ALARM=10
 
-# IOPS arbiter (off unless ABE_IOPS_CAPACITY is set). The drive's measured
-# IOPS (fio, 4k random write, iodepth 32, 4 jobs); every export then gets a
-# ceiling from GET /qos/<id>: guaranteed the smaller of half its fair share
-# and its part of ABE_QOS_GUARANTEE_PCT of the drive, at most
-# ABE_QOS_CEILING_PCT of it, and all of them together at most that too.
+# IOPS arbiter. Every export gets a ceiling (GET /qos/<id>): guaranteed the
+# smaller of half its fair share and its part of ABE_QOS_GUARANTEE_PCT of
+# the drive, at most ABE_QOS_CEILING_PCT of it, all of them together at most
+# that too. The drive's IOPS: ABE_IOPS_CAPACITY, else measured on the first
+# start (30 s of fio on a scratch LV) and kept in ABE_QOS_RECORD; delete the
+# record to measure again, ABE_QOS_MEASURE=0 to never measure.
 #ABE_IOPS_CAPACITY=
+#ABE_QOS_RECORD=/var/lib/abe/drive.json
+#ABE_QOS_MEASURE=1
+#ABE_QOS_FIO_SECONDS=30
 #ABE_QOS_GUARANTEE_PCT=33
 #ABE_QOS_CEILING_PCT=80
 #ABE_QOS_INTERVAL_SECS=5
