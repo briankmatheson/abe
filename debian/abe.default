@@ -55,13 +55,16 @@
 # IOPS arbiter. Every export gets a ceiling (GET /qos/<id>): guaranteed the
 # smaller of half its fair share and its part of ABE_QOS_GUARANTEE_PCT of
 # the drive, at most ABE_QOS_CEILING_PCT of it, all of them together at most
-# that too. The drive's IOPS: ABE_IOPS_CAPACITY, else measured on the first
-# start (30 s of fio on a scratch LV) and kept in ABE_QOS_RECORD; delete the
+# that too. The drive's IOPS: ABE_IOPS_CAPACITY, else measured once (10 s of
+# fio on a scratch LV, only while I/O pressure is under ABE_QOS_QUIET_PCT,
+# retried every ABE_QOS_RETRY_SECS) and kept in ABE_QOS_RECORD; delete the
 # record to measure again, ABE_QOS_MEASURE=0 to never measure.
 #ABE_IOPS_CAPACITY=
 #ABE_QOS_RECORD=/var/lib/abe/drive.json
 #ABE_QOS_MEASURE=1
-#ABE_QOS_FIO_SECONDS=30
+#ABE_QOS_FIO_SECONDS=10
+#ABE_QOS_QUIET_PCT=2
+#ABE_QOS_RETRY_SECS=600
 #ABE_QOS_GUARANTEE_PCT=33
 #ABE_QOS_CEILING_PCT=80
 #ABE_QOS_INTERVAL_SECS=5

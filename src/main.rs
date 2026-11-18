@@ -1995,17 +1995,43 @@ fn export_new(id: &str, tags: &[String], client: Ipv4Addr) -> Res<(Message, u16)
     Ok((m, port))
 }
 
+/// Share of the last minute some task waited on I/O (`/proc/pressure/io`,
+/// "some avg60"), in percent; None where PSI is not available.
+fn io_pressure_avg60() -> Option<f64> {
+    let s = fs::read_to_string("/proc/pressure/io").ok()?;
+    let line = s.lines().find(|l| l.starts_with("some"))?;
+    line.split_whitespace()
+        .find_map(|f| f.strip_prefix("avg60="))
+        .and_then(|v| v.parse().ok())
+}
+
 /// Measure the drive for the IOPS arbiter: a scratch LV, ABE_QOS_FIO_SECONDS
-/// (30, after 5 s of warm-up) of 4k random writes at iodepth 32 from 4 jobs,
+/// (10, after 2 s of warm-up) of 4k random writes at iodepth 32 from 4 jobs,
 /// the LV removed again. Total write IOPS. The LV is made and removed under
 /// OPS; fio runs outside it.
+///
+/// Only on a quiet drive: a full-depth fio on a busy hub stalls everything
+/// sharing it (etcd, on an xdebbie hub), so this refuses, and the arbiter
+/// tries again later, while I/O pressure (PSI some avg60) is over
+/// ABE_QOS_QUIET_PCT (2) percent.
 pub fn measure_drive() -> Result<f64> {
     const LV: &str = "abe-qos-probe";
+    let quiet = var("ABE_QOS_QUIET_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(2.0);
+    if let Some(p) = io_pressure_avg60() {
+        if p > quiet {
+            return Err(Error::other(format!(
+                "the drive is busy (I/O pressure {p:.1}% over the last minute, quiet is under {quiet}%)"
+            )));
+        }
+    }
     let secs = var("ABE_QOS_FIO_SECONDS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(30);
+        .unwrap_or(10);
     with_ops(|| {
         rollback_lv(LV); // a probe left behind by an interrupted run
         create_lv(LV, "4G", true)
@@ -2025,7 +2051,7 @@ pub fn measure_drive() -> Result<f64> {
             "--direct=1",
             "--ioengine=libaio",
             "--time_based",
-            "--ramp_time=5",
+            "--ramp_time=2",
             "--runtime",
             &secs.to_string(),
             "--output-format=json",
