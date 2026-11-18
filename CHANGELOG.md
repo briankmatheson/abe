@@ -12,8 +12,10 @@
   enforce them (abe-csi, with cgroup `io.max`). `ABE_QOS_GUARANTEE_PCT`,
   `ABE_QOS_CEILING_PCT` and `ABE_QOS_INTERVAL_SECS` tune it.
 - The drive's IOPS: `ABE_IOPS_CAPACITY` if set; otherwise abe measures it
-  once, on the first start (30 s of fio, 4k random writes at iodepth 32
-  from 4 jobs, on a scratch LV it then removes), and records it in
+  once (10 s of fio, 4k random writes at iodepth 32 from 4 jobs, on a
+  scratch LV it then removes), only while the drive is quiet (I/O pressure
+  under `ABE_QOS_QUIET_PCT`, 2%, over the last minute; otherwise it tries
+  again every `ABE_QOS_RETRY_SECS`, 10 min), and records it in
   `/var/lib/abe/drive.json` (`ABE_QOS_RECORD`). Delete that file to
   measure again; `ABE_QOS_MEASURE=0` never measures.
 

@@ -29,7 +29,8 @@
 //!
 //! The drive's capacity C: `ABE_IOPS_CAPACITY`, else what abe measured on
 //! its first run and recorded (`ABE_QOS_RECORD`, /var/lib/abe/drive.json):
-//! fio on a scratch LV, 4k random writes at iodepth 32 from 4 jobs. Delete
+//! fio on a scratch LV, 4k random writes at iodepth 32 from 4 jobs, for 10 s,
+//! and only while the drive is quiet (it retries every 10 min). Delete
 //! the record to measure again; `ABE_QOS_MEASURE=0` never measures. Until C
 //! is known nothing is shaped.
 
@@ -311,36 +312,32 @@ async fn capacity(measure: fn() -> std::io::Result<f64>) -> Option<(f64, String)
         info!("qos: no ABE_IOPS_CAPACITY, no record and ABE_QOS_MEASURE=0: exports are not shaped");
         return None;
     }
-    match tokio::task::spawn_blocking(measure).await {
-        Ok(Ok(iops)) if iops > 0.0 => match save_record(iops) {
-            Ok(r) => {
-                info!(
-                    "qos: the drive does {:.0} IOPS; recorded in {}",
-                    iops,
-                    record_path()
-                );
-                Some((r.capacity_iops, format!("measured {}", r.measured_at)))
+    // Measure, on a quiet drive: measure_drive refuses while the drive is
+    // busy; try again every ABE_QOS_RETRY_SECS (600) until it works.
+    let retry = var("ABE_QOS_RETRY_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(600);
+    loop {
+        match tokio::task::spawn_blocking(measure).await {
+            Ok(Ok(iops)) if iops > 0.0 => {
+                return match save_record(iops) {
+                    Ok(r) => {
+                        info!("qos: the drive does {:.0} IOPS; recorded in {}", iops, record_path());
+                        Some((r.capacity_iops, format!("measured {}", r.measured_at)))
+                    }
+                    Err(e) => {
+                        warn!("qos: measured {iops:.0} IOPS but could not record it in {}: {e}", record_path());
+                        Some((iops, "measured (not recorded)".into()))
+                    }
+                };
             }
-            Err(e) => {
-                warn!(
-                    "qos: measured {iops:.0} IOPS but could not record it in {}: {e}",
-                    record_path()
-                );
-                Some((iops, "measured (not recorded)".into()))
-            }
-        },
-        Ok(Ok(_)) => {
-            warn!("qos: the measurement came back empty; exports are not shaped");
-            None
+            Ok(Ok(_)) => warn!("qos: the measurement came back empty"),
+            Ok(Err(e)) => warn!("qos: not measuring the drive yet: {e}; again in {retry}s (or set ABE_IOPS_CAPACITY)"),
+            Err(e) => warn!("qos: measurement task: {e}"),
         }
-        Ok(Err(e)) => {
-            warn!("qos: could not measure the drive ({e}); exports are not shaped. Set ABE_IOPS_CAPACITY");
-            None
-        }
-        Err(e) => {
-            warn!("qos: measurement task: {e}");
-            None
-        }
+        tokio::time::sleep(std::time::Duration::from_secs(retry)).await;
     }
 }
 
