@@ -9,10 +9,13 @@
   its fair share and its part of 33% of the drive; one volume may burst to
   80%; all of them together never past 80%. Below 90% of that nothing is
   shaped. `GET /qos` and `GET /qos/<id>` report the ceilings; initiators
-  enforce them (abe-csi, with cgroup `io.max`). Off unless
-  `ABE_IOPS_CAPACITY` (the drive's measured IOPS) is set;
-  `ABE_QOS_GUARANTEE_PCT`, `ABE_QOS_CEILING_PCT` and
-  `ABE_QOS_INTERVAL_SECS` tune it.
+  enforce them (abe-csi, with cgroup `io.max`). `ABE_QOS_GUARANTEE_PCT`,
+  `ABE_QOS_CEILING_PCT` and `ABE_QOS_INTERVAL_SECS` tune it.
+- The drive's IOPS: `ABE_IOPS_CAPACITY` if set; otherwise abe measures it
+  once, on the first start (30 s of fio, 4k random writes at iodepth 32
+  from 4 jobs, on a scratch LV it then removes), and records it in
+  `/var/lib/abe/drive.json` (`ABE_QOS_RECORD`). Delete that file to
+  measure again; `ABE_QOS_MEASURE=0` never measures.
 
 ## 0.6.1
 

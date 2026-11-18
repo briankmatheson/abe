@@ -18,6 +18,8 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
 ReadWritePaths=/etc/lvm /sys/kernel/config /dev /run
+# the IOPS arbiter's first-run drive measurement
+StateDirectory=abe
 
 # Resource limits
 LimitNOFILE=65536
