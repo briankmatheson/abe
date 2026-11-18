@@ -23,7 +23,7 @@ steps:
     image: registry.mesh.bmath.nyc/xdebbie-builder:2
     resources:
       limits:
-        memory: 2560MiB
+        memory: 1536MiB
     commands:
       - cargo fmt --check
       - cargo clippy --all-targets -- -D warnings
@@ -39,7 +39,7 @@ steps:
         path: /secrets/apt-signing
     resources:
       limits:
-        memory: 2560MiB
+        memory: 1536MiB
     commands:
       - cargo deb
       - apt-publish target/debian/*.deb
