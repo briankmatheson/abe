@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.0
+
+- IOPS arbiter (`src/qos.rs`): the exports share the drive with whatever
+  else the host runs (on an xdebbie hub, the VMs' own disks and etcd).
+  Every 5 s abe reads each exported LV's I/O counters and gives every
+  volume a ceiling: each active volume is guaranteed the smaller of half
+  its fair share and its part of 33% of the drive; one volume may burst to
+  80%; all of them together never past 80%. Below 90% of that nothing is
+  shaped. `GET /qos` and `GET /qos/<id>` report the ceilings; initiators
+  enforce them (abe-csi, with cgroup `io.max`). Off unless
+  `ABE_IOPS_CAPACITY` (the drive's measured IOPS) is set;
+  `ABE_QOS_GUARANTEE_PCT`, `ABE_QOS_CEILING_PCT` and
+  `ABE_QOS_INTERVAL_SECS` tune it.
+
 ## 0.6.1
 
 - LVM watchdog reworked. 0.6.0 deleted any controller that was
