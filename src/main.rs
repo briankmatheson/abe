@@ -21,6 +21,8 @@ use std::process::Command;
 use std::str;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+mod qos;
 //use env_inventory;
 
 const CONFIGFS_PATH: &str = "/sys/kernel/config";
@@ -2228,6 +2230,26 @@ async fn attach(
     .map(Json)
 }
 
+/// GET /qos: the arbiter's view, every export's ceiling and guarantee.
+async fn qos_all() -> Json<qos::Report> {
+    Json(qos::report())
+}
+
+/// GET /qos/<id>: one export's share. Unshaped (`ceiling_iops` null) while
+/// the arbiter is off or has not seen the volume yet.
+async fn qos_one(EP(id): EP<String>) -> Json<serde_json::Value> {
+    let r = qos::report();
+    let v = r.volumes.get(&id);
+    Json(serde_json::json!({
+        "id": id,
+        "enabled": r.enabled,
+        "contended": r.contended,
+        "ceiling_iops": v.map(|a| a.ceiling_iops),
+        "guarantee_iops": v.map(|a| a.guarantee_iops),
+        "demand_iops": v.map(|a| a.demand_iops),
+    }))
+}
+
 /// DELETE /id/<id>: stop exporting the volume and remove its LV.
 /// Idempotent: returns 404 only if neither an export nor an LV exists.
 async fn detach(EP(id): EP<String>) -> std::result::Result<Json<Message>, ApiError> {
@@ -3122,6 +3144,10 @@ async fn main() {
     // request can be served, so nobody sees a half-restored target.
     reexport_at_startup().await;
 
+    // The IOPS arbiter: shares the drive between the exports (off without
+    // ABE_IOPS_CAPACITY); initiators read their ceilings from /qos/<id>.
+    qos::spawn(nvmet_path());
+
     let app = Router::new()
         .route("/id/:id", get(attach).delete(detach))
         .route("/configure", get(configure))
@@ -3130,6 +3156,8 @@ async fn main() {
         .route("/utilization", get(utilization))
         .route("/reexport", get(reexport))
         .route("/seal/:id", get(seal))
+        .route("/qos", get(qos_all))
+        .route("/qos/:id", get(qos_one))
         .route("/version", get(version));
 
     info!(
