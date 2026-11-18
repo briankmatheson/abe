@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.1
+
+The IOPS arbiter release. (A `v0.7.0` tag already exists on GitHub, on an
+older commit that still built 0.6.1; this is the first real 0.7 release.)
+
 ## 0.7.0
 
 - IOPS arbiter (`src/qos.rs`): the exports share the drive with whatever
