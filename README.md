@@ -214,6 +214,7 @@ API
 | `GET /configure?base=<image>&bytes=N` | make (or return) the base volume for `<image>`: raw, no fio; the reply adds `"base"` and `"sealed"`; 409 if the existing base is smaller than N; a sealed base is returned without a port |
 | `GET /seal/<id>` | freeze a filled base: unexport it, tag `abe_sealed`; idempotent; 400 if `<id>` is not a base; reply `{"id","base","sealed":true,"bytes"}` |
 | `GET /id/<id>` | (re-)export an existing volume; idempotent; 409 on a sealed base |
+| `GET /grow/<id>?bytes=N` | grow a volume to N bytes (rounded up to a MiB; never shrinks): `lvextend`, then every nvmet namespace exporting it re-reads its size (`revalidate_size`), so a connected initiator sees it without reconnecting; the filesystem on it is left alone; idempotent; 409 if the kernel's nvmet lacks `revalidate_size`; reply `{"id","from","bytes","revalidated"}` |
 | `DELETE /id/<id>` | unexport and remove the volume; idempotent; allowed on a base (its clones keep their data) |
 | `GET /volumes` | list every volume: `id`, `bytes`, `port` (if exported), `traddr`, `nqn`, `used_bytes`, `data_percent`, `origin`, `layers`, `warning`, `base`, `sealed`, `name`, `client` (the address the fence opens its port to) |
 | `GET /clone/<id>` or `?bytes=N[&name=..]` | create a new volume as a thin snapshot of `<id>` (shares blocks until written; optionally grown to N bytes) and export it; needs `ABE_THIN_POOL`; a base must be sealed first (409); `name` works as for `/configure` |

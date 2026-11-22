@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.2
+
+- `GET /grow/<id>?bytes=N`: grow a volume (never shrink it). `lvextend`, then
+  each nvmet namespace exporting it re-reads its size (`revalidate_size`), so
+  a connected initiator sees the new size without reconnecting. The
+  filesystem on it is left alone: aviary uses the new space as a write-test
+  reserve after the filesystem's end. Feature `grow` in `/version`.
+
 ## 0.7.1
 
 The IOPS arbiter release. (A `v0.7.0` tag already exists on GitHub, on an

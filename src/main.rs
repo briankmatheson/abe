@@ -1927,13 +1927,100 @@ async fn seal(EP(id): EP<String>) -> std::result::Result<Json<SealReply>, ApiErr
     .map(Json)
 }
 
+#[derive(Deserialize, Default)]
+struct GrowParams {
+    /// the size to grow to, in bytes (rounded up to a whole MiB); never shrinks
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct GrowReply {
+    id: String,
+    /// the LV's size before and after
+    from: u64,
+    bytes: u64,
+    /// nvmet namespaces told to re-read the size (revalidate_size)
+    revalidated: u32,
+}
+
+/// GET /grow/<id>?bytes=N: grow a volume to N bytes, never shrink it.
+/// lvextend, then each nvmet namespace exporting it re-reads its size
+/// (revalidate_size), so a connected initiator sees the new size without a
+/// reconnect. Idempotent: asking for a size it already has does nothing.
+/// The filesystem (or LUKS mapping) on it is not touched: that is the
+/// client's to grow, if it wants to (aviary leaves the new space as a write
+/// test reserve after the filesystem's end).
+async fn grow(
+    EP(id): EP<String>,
+    Query(p): Query<GrowParams>,
+) -> std::result::Result<Json<GrowReply>, ApiError> {
+    info!("grow {id} to {} bytes", p.bytes);
+    run_blocking(move || with_ops(|| grow_locked(&id, p.bytes)))
+        .await
+        .map(Json)
+}
+
+fn extend_lv(path: &str, bytes: u64) -> Result<()> {
+    check(
+        Command::new("/usr/sbin/lvextend")
+            .args(["-y", "-L", &bytes_to_lv_size(bytes), path])
+            .lvm_output()?,
+        "lvextend",
+    )
+}
+
+fn grow_locked(id: &str, bytes: u64) -> Res<GrowReply> {
+    let lvs = list_lvs().map_err(Fail::ctx("lvs"))?;
+    let lv = lvs
+        .iter()
+        .find(|l| l.name == id)
+        .ok_or_else(|| Fail::not_found(id))?;
+    let from = lv.bytes;
+    if bytes > from {
+        let path = format!("{}/{}", vg_name(), id);
+        extend_lv(&path, bytes).map_err(Fail::ctx("lvextend"))?;
+    }
+    let now = list_lvs()
+        .map_err(Fail::ctx("lvs"))?
+        .into_iter()
+        .find(|l| l.name == id)
+        .map(|l| l.bytes)
+        .unwrap_or(from);
+    // every namespace of the volume's subsystem: tell nvmet the size changed
+    let mut revalidated = 0;
+    let nsdir = Path::new(&nvmet_path())
+        .join("subsystems")
+        .join(id)
+        .join("namespaces");
+    if let Ok(rd) = fs::read_dir(&nsdir) {
+        for ns in rd.flatten() {
+            let f = ns.path().join("revalidate_size");
+            if !f.exists() {
+                return Err(Fail::conflict(format!(
+                    "grew {id} to {now} bytes, but this kernel's nvmet has no revalidate_size: \
+                     the initiator sees the new size after it reconnects"
+                )));
+            }
+            fs::write(&f, "1").map_err(|e| Fail::ctx("revalidate_size")(e.into()))?;
+            revalidated += 1;
+        }
+    }
+    info!("{id}: {from} -> {now} bytes, {revalidated} namespace(s) revalidated");
+    Ok(GrowReply {
+        id: id.to_string(),
+        from,
+        bytes: now,
+        revalidated,
+    })
+}
+
 /// GET /version: what this abe is and can do.
 async fn version() -> Json<Version> {
     Json(version_info())
 }
 
 fn version_info() -> Version {
-    let mut features = vec!["reexport", "ports", "name", "trim", "tls", "fence"];
+    let mut features = vec!["reexport", "ports", "name", "trim", "tls", "fence", "grow"];
     if thin_pool().is_some() {
         // bases are only useful as thin clone origins
         features.extend(["base", "clone"]);
@@ -3239,6 +3326,7 @@ async fn main() {
         .route("/utilization", get(utilization))
         .route("/reexport", get(reexport))
         .route("/seal/:id", get(seal))
+        .route("/grow/:id", get(grow))
         .route("/qos", get(qos_all))
         .route("/qos/:id", get(qos_one))
         .route("/version", get(version));
