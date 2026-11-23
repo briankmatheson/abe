@@ -2001,7 +2001,7 @@ fn grow_locked(id: &str, bytes: u64) -> Res<GrowReply> {
                      the initiator sees the new size after it reconnects"
                 )));
             }
-            fs::write(&f, "1").map_err(|e| Fail::ctx("revalidate_size")(e.into()))?;
+            fs::write(&f, "1").map_err(|e| Fail::ctx("revalidate_size")(e))?;
             revalidated += 1;
         }
     }
